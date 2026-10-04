@@ -293,6 +293,60 @@ class Problem(object):
             return iter(())
         return self._solver.getSolutionIter(domains, constraints, vconstraints)
 
+    def getProjectionIter(self, visible):
+        """
+        Return an iterator over distinct assignments of the visible variables
+
+        Variables not listed in C{visible} are hidden: they still participate
+        in the constraints and act as a satisfiability witness, but their
+        values never appear in the yielded results.
+
+        Every distinct assignment of the visible variables that can be
+        extended to a full solution is yielded exactly once. After a
+        projection is yielded, that visible assignment is blocked for the
+        remainder of this iteration session only; the problem itself is not
+        modified, so closing the iterator and solving again still returns
+        the original answers.
+
+        Example:
+
+        >>> problem = Problem()
+        >>> problem.addVariable("m", [0, 1])
+        >>> problem.addVariable("w", [0, 1])
+        >>> projections = list(problem.getProjectionIter(["m"]))
+        >>> sorted(projections, key=lambda item: item["m"])
+        [{'m': 0}, {'m': 1}]
+        >>> sorted(problem.getSolutions(), key=lambda item: (item["m"], item["w"]))
+        [{'m': 0, 'w': 0}, {'m': 0, 'w': 1}, {'m': 1, 'w': 0}, {'m': 1, 'w': 1}]
+
+        With an empty projection a satisfiable problem yields exactly one
+        (empty) result, while an unsatisfiable one yields nothing:
+
+        >>> problem = Problem()
+        >>> problem.addVariable("w", [0, 1])
+        >>> list(problem.getProjectionIter([]))
+        [{}]
+
+        @param visible: Variables whose assignments should be enumerated;
+                        all other variables are treated as hidden witnesses
+        @type  visible: sequence of variables
+        @return: Iterator yielding a dictionary mapping each visible
+                 variable to its value, once per distinct visible assignment
+        @rtype: iterator
+        """
+        domains, constraints, vconstraints = self._getArgs()
+        if not domains:
+            return iter(())
+        visible = tuple(visible)
+        unknown = [variable for variable in visible if variable not in domains]
+        if unknown:
+            raise ValueError("Unknown variable(s): %s" % repr(unknown))
+        if len(set(visible)) != len(visible):
+            raise ValueError("Duplicate visible variable(s)")
+        return self._solver.getProjectionIter(
+            domains, constraints, vconstraints, visible
+        )
+
     def _getArgs(self):
         domains = self._variables.copy()
         allvariables = domains.keys()
@@ -437,6 +491,14 @@ class Solver(object):
         msg = "%s doesn't provide iteration" % self.__class__.__name__
         raise NotImplementedError(msg)
 
+    def getProjectionIter(self, domains, constraints, vconstraints, visible):
+        """
+        Return an iterator over distinct assignments of the visible
+        variables, as documented in L{Problem.getProjectionIter}
+        """
+        msg = "%s doesn't provide projection iteration" % self.__class__.__name__
+        raise NotImplementedError(msg)
+
 
 class BacktrackingSolver(Solver):
     """
@@ -565,6 +627,43 @@ class BacktrackingSolver(Solver):
 
     def getSolutions(self, domains, constraints, vconstraints):
         return list(self.getSolutionIter(domains, constraints, vconstraints))
+
+    def getProjectionIter(self, domains, constraints, vconstraints, visible):
+        # Work on private copies so that two iterators (or a projection
+        # iterator and an ordinary solve) may run interleaved without
+        # sharing forward-checking domain states. The caller's Problem is
+        # never touched, since domains/constraints/vconstraints are already
+        # fresh per solve; only the domains themselves are shared objects.
+        domains = dict(
+            (variable, Domain(domain[:])) for variable, domain in domains.items()
+        )
+
+        solution_iter = self.getSolutionIter(domains, constraints, vconstraints)
+        visible = tuple(visible)
+        allvariables = list(domains)
+
+        while True:
+            try:
+                solution = next(solution_iter)
+            except StopIteration:
+                return
+
+            projection = dict(
+                (variable, solution[variable]) for variable in visible
+            )
+
+            # Block this visible assignment for the rest of this session
+            # only. The blocker is attached to every variable so that it is
+            # rechecked while hidden witnesses are being re-assigned,
+            # pruning the whole hidden subtree instead of revisiting it for
+            # every auxiliary completion.
+            blocker = _ProjectionBlock(visible, projection)
+            pair = (blocker, allvariables)
+            constraints.append(pair)
+            for variable in allvariables:
+                vconstraints[variable].append(pair)
+
+            yield projection
 
 
 class RecursiveBacktrackingSolver(Solver):
@@ -938,6 +1037,29 @@ class Constraint(object):
                 if not domain:
                     return False
         return True
+
+
+class _ProjectionBlock(Constraint):
+    """
+    Session-local constraint rejecting one blocked visible assignment
+
+    Hidden variables may take any value; only a full match against the
+    blocked visible assignment is rejected, so the search backtracks to a
+    different visible assignment instead of exploring the hidden witness
+    subtree again.
+    """
+
+    def __init__(self, visible, blocked):
+        self._visible = tuple(visible)
+        self._blocked = blocked
+
+    def __call__(self, variables, domains, assignments, forwardcheck=False):
+        for variable in self._visible:
+            if variable not in assignments:
+                return True
+            if assignments[variable] != self._blocked[variable]:
+                return True
+        return False
 
 
 class FunctionConstraint(Constraint):
