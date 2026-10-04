@@ -35,6 +35,7 @@
                     FunctionConstraint,
                     AllDifferentConstraint,
                     AllEqualConstraint,
+                    CumulativeConstraint,
                     MaxSumConstraint,
                     ExactSumConstraint,
                     MinSumConstraint,
@@ -58,6 +59,7 @@ from .version import __url__  # noqa
 
 import random
 import copy
+import numbers
 from .compat import xrange
 
 __all__ = [
@@ -73,6 +75,7 @@ __all__ = [
     "FunctionConstraint",
     "AllDifferentConstraint",
     "AllEqualConstraint",
+    "CumulativeConstraint",
     "MaxSumConstraint",
     "ExactSumConstraint",
     "MinSumConstraint",
@@ -385,6 +388,23 @@ def doArc8(arcs, domains, assignments):
     return True
 
 
+def getConstraintCandidateValues(variable, domains, vconstraints, assignments):
+    values = domains[variable][:]
+    for constraint, variables in vconstraints[variable]:
+        candidate_values = constraint.candidateValues(
+            variables, domains, assignments, variable
+        )
+        if candidate_values is None:
+            continue
+        if not candidate_values:
+            return []
+        candidate_set = set(candidate_values)
+        values = [value for value in values if value in candidate_set]
+        if not values:
+            return []
+    return values
+
+
 class Solver(object):
     """
     Abstract base class for solvers
@@ -505,6 +525,10 @@ class BacktrackingSolver(Solver):
                         ]
                     else:
                         pushdomains = None
+                    if forwardcheck:
+                        values = getConstraintCandidateValues(
+                            variable, domains, vconstraints, assignments
+                        )
                     break
             else:
                 # No unassigned variables. We've got a solution. Go back
@@ -521,7 +545,8 @@ class BacktrackingSolver(Solver):
                 # We have a variable. Do we have any values left?
                 if not values:
                     # No. Go back to last variable, if there's one.
-                    del assignments[variable]
+                    if variable in assignments:
+                        del assignments[variable]
                     while queue:
                         variable, values, pushdomains = queue.pop()
                         if pushdomains:
@@ -626,15 +651,23 @@ class RecursiveBacktrackingSolver(Solver):
             return solutions
 
         variable = item[-1]
-        assignments[variable] = None
-
         forwardcheck = self._forwardcheck
         if forwardcheck:
-            pushdomains = [domains[x] for x in domains if x not in assignments]
+            pushdomains = [
+                domains[x] for x in domains if x not in assignments and x != variable
+            ]
         else:
             pushdomains = None
 
-        for value in domains[variable]:
+        if forwardcheck:
+            values = getConstraintCandidateValues(
+                variable, domains, vconstraints, assignments
+            )
+        else:
+            values = domains[variable][:]
+        assignments[variable] = None
+
+        for value in values:
             assignments[variable] = value
             if pushdomains:
                 for domain in pushdomains:
@@ -939,6 +972,14 @@ class Constraint(object):
                     return False
         return True
 
+    def candidateValues(self, variables, domains, assignments, variable):
+        """
+        Return feasible values for a variable without modifying its domain.
+
+        Returning None means that the constraint does not restrict the values.
+        """
+        return None
+
 
 class FunctionConstraint(Constraint):
     """
@@ -1071,6 +1112,193 @@ class AllEqualConstraint(Constraint):
                         if value != singlevalue:
                             domain.hideValue(value)
         return True
+
+
+class CumulativeConstraint(Constraint):
+    """
+    Constraint enforcing cumulative resource usage for fixed tasks.
+
+    Each variable is an integer start time. The corresponding duration and
+    demand define the half-open task interval [start, start + duration).
+    Tasks with zero duration do not consume capacity.
+    """
+
+    def __init__(self, capacity, durations, demands=None):
+        """
+        @param capacity: Maximum amount simultaneously available
+        @type capacity: non-negative integer
+        @param durations: Task durations, aligned with the constrained variables
+        @type durations: sequence of non-negative integers
+        @param demands: Capacity consumed by each task (default is one each)
+        @type demands: sequence of non-negative integers, or None
+        """
+        self._capacity = self._checkInteger(capacity, "capacity")
+        self._durations = self._checkSequence(durations, "durations")
+        if demands is None:
+            self._demands = [1] * len(self._durations)
+        else:
+            self._demands = self._checkSequence(demands, "demands")
+
+    @staticmethod
+    def _checkInteger(value, name):
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            raise TypeError("%s must be an integer" % name)
+        if value < 0:
+            raise ValueError("%s must be non-negative" % name)
+        return value
+
+    @staticmethod
+    def _checkStart(value):
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            raise TypeError("start time must be an integer")
+        return value
+
+    @classmethod
+    def _checkSequence(cls, values, name):
+        checked = []
+        for value in values:
+            checked.append(cls._checkInteger(value, name[:-1]))
+        return checked
+
+    def _validateSizes(self, variables):
+        if len(variables) != len(self._durations):
+            msg = "got %d variables but %d durations" % (
+                len(variables),
+                len(self._durations),
+            )
+            raise ValueError(msg)
+        if len(variables) != len(self._demands):
+            msg = "got %d variables but %d demands" % (
+                len(variables),
+                len(self._demands),
+            )
+            raise ValueError(msg)
+
+    @staticmethod
+    def _domainInterval(domain):
+        starts = [
+            value
+            for value in domain
+            if not isinstance(value, bool) and isinstance(value, numbers.Integral)
+        ]
+        if not starts or len(starts) != len(domain):
+            return None
+        return min(starts), max(starts)
+
+    @staticmethod
+    def _addInterval(events, start, end, demand):
+        if demand and start < end:
+            events.append((start, demand))
+            events.append((end, -demand))
+
+    @classmethod
+    def _isOverload(cls, events, capacity):
+        events.sort(key=lambda event: event[0])
+        usage = 0
+        index = 0
+        while index < len(events):
+            point = events[index][0]
+            while index < len(events) and events[index][0] == point:
+                usage += events[index][1]
+                index += 1
+            if usage > capacity:
+                return True
+        return False
+
+    def _mandatoryEvents(
+        self, variables, domains, assignments=None, skip_variable=None
+    ):
+        events = []
+        assignments = assignments or {}
+        for index, variable in enumerate(variables):
+            if variable == skip_variable:
+                continue
+            duration = self._durations[index]
+            demand = self._demands[index]
+            if not duration or not demand:
+                continue
+            if variable in assignments:
+                start = assignments[variable]
+                self._checkStart(start)
+                interval = (start, start + duration)
+            else:
+                interval = self._domainInterval(domains[variable])
+                if interval is None:
+                    continue
+                earliest_start, latest_start = interval
+                interval = (latest_start, earliest_start + duration)
+            self._addInterval(events, interval[0], interval[1], demand)
+        return events
+
+    def _feasibleValues(self, domain, events, duration, demand):
+        if not duration or not demand:
+            return list(domain)
+        base_events = list(events)
+        values = []
+        for start in domain[:]:
+            candidate_events = list(base_events)
+            self._addInterval(candidate_events, start, start + duration, demand)
+            if self._isOverload(candidate_events, self._capacity):
+                continue
+            values.append(start)
+        return values
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        self._validateSizes(variables)
+        if len(set(variables)) != len(variables):
+            raise ValueError("variables must be unique")
+        for variable in variables:
+            domain = domains[variable]
+            if not domain:
+                return
+            if self._domainInterval(domain) is None:
+                raise TypeError("start times must be integers")
+
+        while True:
+            changed = False
+            for index, variable in enumerate(variables):
+                domain = domains[variable]
+                values = self._feasibleValues(
+                    domain,
+                    self._mandatoryEvents(
+                        variables, domains, skip_variable=variable
+                    ),
+                    self._durations[index],
+                    self._demands[index],
+                )
+                if len(values) != len(domain):
+                    feasible = set(values)
+                    for value in domain[:]:
+                        if value not in feasible:
+                            domain.remove(value)
+                    changed = True
+                if not domain:
+                    return
+            if not changed:
+                return
+
+    def __call__(self, variables, domains, assignments, forwardcheck=False):
+        self._validateSizes(variables)
+        events = self._mandatoryEvents(variables, domains, assignments)
+        if self._isOverload(list(events), self._capacity):
+            return False
+
+        return True
+
+    def candidateValues(self, variables, domains, assignments, variable):
+        index = variables.index(variable)
+        values = self._feasibleValues(
+            domains[variable],
+            self._mandatoryEvents(
+                variables,
+                domains,
+                assignments,
+                skip_variable=variable,
+            ),
+            self._durations[index],
+            self._demands[index],
+        )
+        return values
 
 
 class MaxSumConstraint(Constraint):

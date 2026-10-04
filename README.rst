@@ -109,6 +109,7 @@ Predefined constraint types currently available:
 - :python:`FunctionConstraint`
 - :python:`AllDifferentConstraint`
 - :python:`AllEqualConstraint`
+- :python:`CumulativeConstraint`
 - :python:`ExactSumConstraint`
 - :python:`MaxSumConstraint`
 - :python:`MinSumConstraint`

@@ -110,5 +110,98 @@ def test_constraint_without_variables():
     assert solutions == [{"a": 3}]
 
 
+def test_cumulative_constraint_with_negative_start_times():
+    problem = constraint.Problem()
+    problem.addVariables(["a", "b", "c"], [-1, 0, 1])
+    problem.addConstraint(
+        constraint.CumulativeConstraint(
+            4, [2, 2, 2], [2, 2, 2]
+        ),
+        ["a", "b", "c"],
+    )
+
+    solutions = problem.getSolutions()
+
+    assert {"a": -1, "b": 1, "c": 1} in solutions
+    assert {"a": -1, "b": -1, "c": 1} in solutions
+    assert {"a": -1, "b": -1, "c": -1} not in solutions
+
+
+def test_cumulative_constraint_allows_adjacent_half_open_intervals():
+    problem = constraint.Problem()
+    problem.addVariables(["a", "b"], [0, 1, 2])
+    problem.addConstraint(
+        constraint.CumulativeConstraint(1, [1, 1], [1, 1]),
+        ["a", "b"],
+    )
+
+    solutions = problem.getSolutions()
+
+    assert {"a": 0, "b": 1} in solutions
+    assert {"a": 1, "b": 0} in solutions
+    assert {"a": 0, "b": 0} not in solutions
+
+
+def test_cumulative_constraint_detects_three_task_peak():
+    problem = constraint.Problem()
+    problem.addVariables(["a", "b", "c"], [0, 1, 2])
+    problem.addConstraint(
+        constraint.CumulativeConstraint(
+            4, [2, 2, 2], [2, 2, 2]
+        ),
+        ["a", "b", "c"],
+    )
+
+    solutions = problem.getSolutions()
+
+    assert len(solutions) == 12
+    assert {"a": 0, "b": 0, "c": 0} not in solutions
+    assert {"a": 0, "b": 2, "c": 2} in solutions
+
+
+def test_cumulative_constraint_with_zero_duration_and_capacity_exceeded():
+    problem = constraint.Problem()
+    problem.addVariables(["a", "b", "c"], [0])
+    problem.addConstraint(
+        constraint.CumulativeConstraint(
+            1, [1, 1, 0], [1, 1, 2]
+        ),
+        ["a", "b", "c"],
+    )
+
+    assert problem.getSolution() is None
+    assert problem.getSolutions() == []
+
+
+def test_cumulative_constraint_returns_no_solution_for_empty_domain():
+    problem = constraint.Problem()
+    problem.addVariable("a", [0, 1])
+    problem.addVariable("b", [0])
+    problem.addConstraint(
+        constraint.CumulativeConstraint(1, [1, 2], [1, 1]),
+        ["a", "b"],
+    )
+
+    assert problem.getSolution() is None
+    assert problem.getSolutions() == []
+
+
+def test_cumulative_constraint_can_be_solved_repeatedly():
+    problem = constraint.Problem()
+    problem.addVariables(["a", "b", "c"], [-1, 0, 1])
+    problem.addConstraint(
+        constraint.CumulativeConstraint(
+            4, [2, 2, 2], [2, 2, 2]
+        ),
+        ["a", "b", "c"],
+    )
+
+    first_solutions = problem.getSolutions()
+    second_solutions = problem.getSolutions()
+
+    assert first_solutions == second_solutions
+    assert problem.getSolution() == problem.getSolution()
+
+
 def test_version():
     assert isinstance(constraint.__version__, compat.string_types)
