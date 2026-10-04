@@ -35,13 +35,15 @@
                     FunctionConstraint,
                     AllDifferentConstraint,
                     AllEqualConstraint,
+                    EqualityConstraint,
                     MaxSumConstraint,
                     ExactSumConstraint,
                     MinSumConstraint,
                     InSetConstraint,
                     NotInSetConstraint,
                     SomeInSetConstraint,
-                    SomeNotInSetConstraint
+                    SomeNotInSetConstraint,
+                    ReifiedConstraint
 """
 
 from __future__ import absolute_import, division, print_function
@@ -58,6 +60,7 @@ from .version import __url__  # noqa
 
 import random
 import copy
+from itertools import product
 from .compat import xrange
 
 __all__ = [
@@ -73,6 +76,7 @@ __all__ = [
     "FunctionConstraint",
     "AllDifferentConstraint",
     "AllEqualConstraint",
+    "EqualityConstraint",
     "MaxSumConstraint",
     "ExactSumConstraint",
     "MinSumConstraint",
@@ -80,6 +84,7 @@ __all__ = [
     "NotInSetConstraint",
     "SomeInSetConstraint",
     "SomeNotInSetConstraint",
+    "ReifiedConstraint",
 ]
 
 
@@ -1073,6 +1078,9 @@ class AllEqualConstraint(Constraint):
         return True
 
 
+EqualityConstraint = AllEqualConstraint
+
+
 class MaxSumConstraint(Constraint):
     """
     Constraint enforcing that values of given variables sum up to
@@ -1493,6 +1501,213 @@ class SomeNotInSetConstraint(Constraint):
                 if found < self._n:
                     return False
         return True
+
+
+class ReifiedConstraint(Constraint):
+    """
+    Constraint linking a boolean variable to the truth of another constraint.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b"], [1, 2])
+    >>> problem.addVariable("same", [False, True])
+    >>> problem.addConstraint(
+    ...     ReifiedConstraint("same", AllEqualConstraint()), ["a", "b"]
+    ... )
+    >>> sorted((solution["a"], solution["b"], solution["same"])
+    ...        for solution in problem.getSolutions())
+    [(1, 1, True), (1, 2, False), (2, 1, False), (2, 2, True)]
+    """
+
+    _missing_relation = object()
+
+    def __init__(self, boolean, relation=_missing_relation, variables=None):
+        if relation is self._missing_relation:
+            if not isinstance(boolean, Constraint):
+                msg = "A relation constraint must be supplied"
+                raise TypeError(msg)
+            relation = boolean
+            boolean = variables
+            variables = None
+        elif isinstance(boolean, Constraint):
+            if variables is not None:
+                msg = "Variables are supplied through addConstraint()"
+                raise TypeError(msg)
+            variables = relation
+            relation = boolean
+            boolean = variables
+            variables = None
+
+        if callable(relation) and not isinstance(relation, Constraint):
+            relation = FunctionConstraint(relation)
+        if not isinstance(
+            relation,
+            (
+                FunctionConstraint,
+                AllDifferentConstraint,
+                AllEqualConstraint,
+                MaxSumConstraint,
+                ExactSumConstraint,
+                MinSumConstraint,
+            ),
+        ):
+            msg = "Only finite-domain relations with complete assignments are supported"
+            raise TypeError(msg)
+        if boolean is None:
+            msg = "A boolean variable must be supplied"
+            raise TypeError(msg)
+
+        self._boolean = boolean
+        self._relation = relation
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        boolean = self._boolean
+        relation_variables = [variable for variable in variables if variable != boolean]
+        if boolean not in domains:
+            msg = "Boolean variable %r is not defined" % (boolean,)
+            raise ValueError(msg)
+        for value in domains[boolean]:
+            if value is not False and value is not True:
+                msg = "Boolean variable domain must contain only True and False"
+                raise ValueError(msg)
+
+        old_entry = (self, variables)
+        new_entry = (self, relation_variables)
+        index = constraints.index(old_entry)
+        constraints[index] = new_entry
+        for variable in relation_variables:
+            vconstraints[variable].remove(old_entry)
+            if new_entry not in vconstraints[variable]:
+                vconstraints[variable].append(new_entry)
+        if old_entry in vconstraints[boolean]:
+            vconstraints[boolean].remove(old_entry)
+        if new_entry not in vconstraints[boolean]:
+            vconstraints[boolean].append(new_entry)
+
+        self._propagate(
+            relation_variables,
+            domains,
+            {},
+            forwardcheck=False,
+            permanent=True,
+            enforce=True,
+        )
+
+    def __call__(
+        self,
+        variables,
+        domains,
+        assignments,
+        forwardcheck=False,
+    ):
+        return self._propagate(
+            variables,
+            domains,
+            assignments,
+            forwardcheck=forwardcheck,
+            permanent=False,
+            enforce=False,
+        )
+
+    def _propagate(
+        self,
+        variables,
+        domains,
+        assignments,
+        forwardcheck,
+        permanent,
+        enforce,
+    ):
+        boolean = self._boolean
+        relation = self._relation
+        free_variables = [
+            variable for variable in variables if variable not in assignments
+        ]
+        possible_true = [set() for _ in free_variables]
+        possible_false = [set() for _ in free_variables]
+        has_true = False
+        has_false = False
+        valid = True
+
+        for values in product(*(domains[variable] for variable in free_variables)):
+            candidate = assignments.copy()
+            candidate.update(zip(free_variables, values))
+            parms = [candidate[variable] for variable in variables]
+            candidate_assignments = dict(zip(variables, parms))
+            if relation(variables, domains, candidate_assignments, False):
+                supported = possible_true
+                has_true = True
+            else:
+                supported = possible_false
+                has_false = True
+            for index, value in enumerate(values):
+                supported[index].add(value)
+
+        boolean_domain = domains[boolean]
+        active_values = [
+            value
+            for value in (False, True)
+            if value in boolean_domain and boolean in assignments
+            and assignments[boolean] is value
+        ]
+        if boolean in assignments:
+            if assignments[boolean] is not False and assignments[boolean] is not True:
+                return False
+            if not active_values:
+                return False
+            active_value = active_values[0]
+            if active_value is True and not has_true:
+                valid = False
+            if active_value is False and not has_false:
+                valid = False
+        elif len(boolean_domain) == 1:
+            active_value = boolean_domain[0]
+            if active_value is True and not has_true:
+                valid = False
+            if active_value is False and not has_false:
+                valid = False
+        else:
+            active_value = None
+
+        if enforce or forwardcheck:
+            if boolean in assignments:
+                supported = possible_true if active_value is True else possible_false
+            elif len(boolean_domain) == 1:
+                supported = possible_true if active_value is True else possible_false
+            else:
+                supported = [
+                    true_values | false_values
+                    for true_values, false_values in zip(possible_true, possible_false)
+                ]
+                if not has_true:
+                    self._removeValue(boolean_domain, True, permanent)
+                if not has_false:
+                    self._removeValue(boolean_domain, False, permanent)
+                if not boolean_domain:
+                    valid = False
+
+            if supported is not None:
+                for variable, values in zip(free_variables, supported):
+                    domain = domains[variable]
+                    for value in domain[:]:
+                        if value not in values:
+                            self._removeValue(domain, value, permanent)
+                    if not domain:
+                        valid = False
+
+        if not valid and permanent:
+            for value in boolean_domain[:]:
+                self._removeValue(boolean_domain, value, permanent)
+
+        return valid
+
+    def _removeValue(self, domain, value, permanent):
+        if permanent:
+            while value in domain:
+                list.remove(domain, value)
+        elif value in domain:
+            domain.hideValue(value)
 
 
 if __name__ == "__main__":
