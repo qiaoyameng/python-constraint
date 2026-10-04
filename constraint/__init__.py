@@ -41,7 +41,8 @@
                     InSetConstraint,
                     NotInSetConstraint,
                     SomeInSetConstraint,
-                    SomeNotInSetConstraint
+                    SomeNotInSetConstraint,
+                    RegularConstraint
 """
 
 from __future__ import absolute_import, division, print_function
@@ -80,6 +81,7 @@ __all__ = [
     "NotInSetConstraint",
     "SomeInSetConstraint",
     "SomeNotInSetConstraint",
+    "RegularConstraint",
 ]
 
 
@@ -245,7 +247,7 @@ class Problem(object):
         @rtype: dictionary mapping variables to values
         """
         domains, constraints, vconstraints = self._getArgs()
-        if not domains:
+        if domains is None:
             return None
         return self._solver.getSolution(domains, constraints, vconstraints)
 
@@ -266,7 +268,7 @@ class Problem(object):
         @rtype: list of dictionaries mapping variables to values
         """
         domains, constraints, vconstraints = self._getArgs()
-        if not domains:
+        if domains is None:
             return []
         return self._solver.getSolutions(domains, constraints, vconstraints)
 
@@ -289,7 +291,7 @@ class Problem(object):
         StopIteration
         """
         domains, constraints, vconstraints = self._getArgs()
-        if not domains:
+        if domains is None:
             return iter(())
         return self._solver.getSolutionIter(domains, constraints, vconstraints)
 
@@ -313,6 +315,16 @@ class Problem(object):
             domain.resetState()
             if not domain:
                 return None, None, None
+        if not domains:
+            if not constraints:
+                return None, None, None
+            for constraint, variables in constraints:
+                if (
+                    isinstance(constraint, RegularConstraint)
+                    and not constraint(variables, domains, {})
+                ):
+                    return None, None, None
+            return domains, constraints, vconstraints
         # doArc8(getArcs(domains, constraints), domains, {})
         return domains, constraints, vconstraints
 
@@ -1492,6 +1504,335 @@ class SomeNotInSetConstraint(Constraint):
             else:
                 if found < self._n:
                     return False
+        return True
+
+
+class RegularConstraint(Constraint):
+    """
+    Constraint enforcing that an ordered sequence is accepted by an NFA.
+
+    Transitions may be supplied as a dictionary of
+    C{(source, symbol): destination(s)} pairs, a nested dictionary of
+    C{source: {symbol: destination(s)}} pairs, or an iterable of
+    C{(source, symbol, destination)} triples.  Initial and accepting states
+    may each contain more than one state.  Epsilon transitions are rejected.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b"], ["x", "y"])
+    >>> transitions = {(0, "x"): [1], (1, "y"): [2]}
+    >>> problem.addConstraint(
+    ...     RegularConstraint(
+    ...         transitions=transitions,
+    ...         initial_states=[0],
+    ...         accepting_states=[2],
+    ...     ),
+    ...     ["a", "b"],
+    ... )
+    >>> problem.getSolution()
+    {'a': 'x', 'b': 'y'}
+
+    @param transitions: NFA transition table or iterable of transition edges
+    @type transitions: dict or iterable
+    @param initial_states: One or more possible initial states
+    @type initial_states: hashable object or iterable
+    @param accepting_states: One or more accepting states
+    @type accepting_states: hashable object or iterable
+    @param epsilon: Symbol or symbols rejected as epsilon moves
+    @type epsilon: object or iterable
+    """
+
+    _initial_keys = (
+        "initial_states",
+        "initial_state",
+        "start_states",
+        "start_state",
+        "starts",
+        "start",
+        "initial",
+        "q0",
+    )
+    _accepting_keys = (
+        "accepting_states",
+        "accepting_state",
+        "final_states",
+        "final_state",
+        "accepting",
+        "accept",
+        "finals",
+        "final",
+        "accepts",
+        "accepted_states",
+        "accept_states",
+    )
+    _transition_keys = (
+        "transitions",
+        "transition",
+        "delta",
+        "transition_function",
+    )
+
+    def __init__(
+        self,
+        transitions=None,
+        initial_states=None,
+        accepting_states=None,
+        final_states=None,
+        epsilon=None,
+        automaton=None,
+    ):
+        if automaton is not None:
+            if any(
+                value is not None
+                for value in (
+                    initial_states,
+                    accepting_states,
+                    transitions,
+                    final_states,
+                )
+            ):
+                msg = "An automaton cannot be combined with its parts"
+                raise TypeError(msg)
+            parsed = self._parseAutomaton(automaton)
+            transitions, initial_states, accepting_states = parsed
+        if accepting_states is None:
+            accepting_states = final_states
+        if transitions is None:
+            raise ValueError("Finite automaton must define transitions")
+
+        self._epsilon_symbols = set([None, ""])
+        if epsilon is not None:
+            if isinstance(epsilon, (str, bytes)):
+                self._epsilon_symbols.add(epsilon)
+            elif not hasattr(epsilon, "__iter__"):
+                self._epsilon_symbols.add(epsilon)
+            else:
+                self._epsilon_symbols.update(epsilon)
+
+        self._initial_states = self._normalizeStates(initial_states)
+        self._accepting_states = self._normalizeStates(accepting_states)
+        self._states = set(self._initial_states)
+        self._states.update(self._accepting_states)
+        self._transitions = {}
+        self._normalizeTransitions(transitions)
+
+    @classmethod
+    def _parseAutomaton(cls, automaton):
+        if isinstance(automaton, dict):
+            if any(key in automaton for key in cls._transition_keys):
+                transitions = cls._firstValue(automaton, cls._transition_keys)
+                initial_states = cls._firstValue(automaton, cls._initial_keys)
+                accepting_states = cls._firstValue(
+                    automaton, cls._accepting_keys
+                )
+                return transitions, initial_states, accepting_states
+            return automaton, None, None
+
+        if isinstance(automaton, (list, tuple)):
+            if len(automaton) == 3 and all(
+                isinstance(edge, (list, tuple)) and len(edge) == 3
+                for edge in automaton
+            ):
+                return automaton, None, None
+            if len(automaton) == 3:
+                return automaton
+            if len(automaton) == 5:
+                (
+                    _states,
+                    _symbols,
+                    transitions,
+                    initial_states,
+                    accepting_states,
+                ) = automaton
+                return transitions, initial_states, accepting_states
+
+        transitions = cls._firstAttribute(automaton, cls._transition_keys)
+        initial_states = cls._firstAttribute(automaton, cls._initial_keys)
+        accepting_states = cls._firstAttribute(automaton, cls._accepting_keys)
+        if transitions is not None:
+            return transitions, initial_states, accepting_states
+        raise ValueError("Unsupported finite automaton representation")
+
+    @staticmethod
+    def _firstValue(mapping, keys):
+        for key in keys:
+            if key in mapping:
+                return mapping[key]
+        return None
+
+    @classmethod
+    def _firstAttribute(cls, automaton, keys):
+        for key in keys:
+            if hasattr(automaton, key):
+                return getattr(automaton, key)
+        return None
+
+    @staticmethod
+    def _normalizeStates(states):
+        if states is None:
+            return set()
+        if isinstance(states, (str, bytes)):
+            states = [states]
+        elif isinstance(states, (list, tuple, set, frozenset)):
+            states = list(states)
+        else:
+            states = [states]
+        normalized = set()
+        for state in states:
+            RegularConstraint._ensureHashable(state, "State")
+            normalized.add(state)
+        return normalized
+
+    @staticmethod
+    def _ensureHashable(value, description):
+        try:
+            hash(value)
+        except TypeError:
+            raise TypeError("%s must be hashable" % description)
+
+    def _normalizeTransitions(self, transitions):
+        if isinstance(transitions, dict):
+            for source, value in transitions.items():
+                if (
+                    isinstance(source, tuple)
+                    and len(source) == 2
+                    and not isinstance(value, dict)
+                ):
+                    state, symbol = source
+                    self._addDestination(state, symbol, value)
+                else:
+                    if not isinstance(value, dict):
+                        raise ValueError("Invalid transition table")
+                    for symbol, destination in value.items():
+                        self._addDestination(source, symbol, destination)
+        elif isinstance(transitions, (list, tuple, set, frozenset)):
+            for edge in transitions:
+                if not isinstance(edge, (list, tuple)) or len(edge) != 3:
+                    raise ValueError(
+                        "Transition edges must contain three items"
+                    )
+                source, symbol, destination = edge
+                self._addDestination(source, symbol, destination)
+        else:
+            raise ValueError("Unsupported transition representation")
+
+    def _addDestination(self, source, symbol, destination):
+        if symbol in self._epsilon_symbols:
+            raise ValueError("Epsilon transitions are not supported")
+        self._ensureHashable(source, "State")
+        self._ensureHashable(symbol, "Symbol")
+
+        if isinstance(destination, (list, tuple, set, frozenset)):
+            targets = list(destination)
+        else:
+            targets = [destination]
+
+        table = self._transitions.setdefault(source, {})
+        target_states = table.setdefault(symbol, set())
+        self._states.add(source)
+        for target in targets:
+            self._ensureHashable(target, "State")
+            self._states.add(target)
+            target_states.add(target)
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        positions = self._positions(variables, domains, {})
+        backward = self._backwardStates(positions)
+        self._forwardStates(
+            variables,
+            domains,
+            {},
+            positions,
+            backward,
+            forwardcheck=False,
+            remove=True,
+        )
+        Constraint.preProcess(
+            self, variables, domains, constraints, vconstraints
+        )
+
+    def __call__(
+        self,
+        variables,
+        domains,
+        assignments,
+        forwardcheck=False,
+    ):
+        if not variables:
+            return bool(self._initial_states & self._accepting_states)
+
+        positions = self._positions(variables, domains, assignments)
+        backward = self._backwardStates(positions)
+        return self._forwardStates(
+            variables,
+            domains,
+            assignments,
+            positions,
+            backward,
+            forwardcheck=forwardcheck,
+            remove=False,
+        )
+
+    def _positions(self, variables, domains, assignments):
+        positions = []
+        for variable in variables:
+            if variable in assignments:
+                positions.append((variable, [assignments[variable]], True))
+            else:
+                positions.append((variable, domains[variable], False))
+        return positions
+
+    def _backwardStates(self, positions):
+        backward = [set() for _ in range(len(positions) + 1)]
+        backward[-1] = set(self._accepting_states)
+
+        for index in range(len(positions) - 1, -1, -1):
+            _variable, values, _assigned = positions[index]
+            future = backward[index + 1]
+            predecessors = set()
+            for source, table in self._transitions.items():
+                for value in values:
+                    targets = table.get(value)
+                    if targets is not None and targets & future:
+                        predecessors.add(source)
+                        break
+            backward[index] = predecessors
+        return backward
+
+    def _forwardStates(
+        self,
+        variables,
+        domains,
+        assignments,
+        positions,
+        backward,
+        forwardcheck,
+        remove,
+    ):
+        states = set(self._initial_states)
+        for index, (variable, values, assigned) in enumerate(positions):
+            future = backward[index + 1]
+            next_states = set()
+            domain = None if assigned else domains[variable]
+            for value in list(values):
+                target_states = set()
+                for state in states:
+                    targets = self._transitions.get(state, {}).get(value)
+                    if targets is not None:
+                        target_states.update(targets & future)
+                if target_states:
+                    next_states.update(target_states)
+                elif assigned:
+                    return False
+                elif forwardcheck or remove:
+                    if remove:
+                        domain.remove(value)
+                    else:
+                        domain.hideValue(value)
+            if not next_states:
+                return False
+            states = next_states
         return True
 
 
