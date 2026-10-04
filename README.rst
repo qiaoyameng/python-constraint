@@ -38,6 +38,38 @@ This interactive Python session demonstrates the module basic operation:
     [{'a': 3, 'b': 2}, {'a': 3, 'b': 1}, {'a': 2, 'b': 3},
      {'a': 2, 'b': 1}, {'a': 1, 'b': 2}, {'a': 1, 'b': 3}]
 
+Lexicographic optimization
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A sequence of integer linear expressions may be minimized
+lexicographically: the first expression is the most important, the second
+one breaks ties on the first, and so on. This suits, for instance, a
+schedule that minimizes overtime first and only then balances cost. The
+search uses the current domains to compute a lower bound and prunes
+branches that cannot improve on the best solution found, so solutions are
+never collected before being compared. The returned result distinguishes
+a proved optimum, an infeasible problem, and an exhausted node budget:
+
+.. code-block:: python
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b"], [1, 2, 3])
+    >>> problem.addConstraint(lambda a, b: a != b, ("a", "b"))
+    >>> overtime = LinearExpr({"a": 1, "b": -1})
+    >>> cost = LinearExpr({"a": 1, "b": 1}, constant=10)
+    >>> result = problem.minimizeLexicographic([overtime, cost])
+    >>> result.status == OptimizationResult.OPTIMAL
+    True
+    >>> result.solution
+    {'a': 1, 'b': 3}
+    >>> result.objective_values
+    [-2, 14]
+
+Pass ``all_solutions=True`` to keep every optimal solution, and
+``node_budget=<int>`` to bound the search; when the budget is exhausted
+the result status is ``budget_exhausted`` and the incumbent is not claimed
+to be optimal.
+
 Rooks problem
 ~~~~~~~~~~~~~
 

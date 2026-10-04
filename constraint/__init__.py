@@ -30,7 +30,10 @@
 @group Solvers: Solver,
                 BacktrackingSolver,
                 RecursiveBacktrackingSolver,
-                MinConflictsSolver
+                MinConflictsSolver,
+                LexicographicBacktrackingSolver
+@group Optimization: LinearExpr,
+                     OptimizationResult
 @group Constraints: Constraint,
                     FunctionConstraint,
                     AllDifferentConstraint,
@@ -58,7 +61,7 @@ from .version import __url__  # noqa
 
 import random
 import copy
-from .compat import xrange
+from .compat import xrange, string_types
 
 __all__ = [
     "Problem",
@@ -69,6 +72,7 @@ __all__ = [
     "BacktrackingSolver",
     "RecursiveBacktrackingSolver",
     "MinConflictsSolver",
+    "LexicographicBacktrackingSolver",
     "Constraint",
     "FunctionConstraint",
     "AllDifferentConstraint",
@@ -80,6 +84,8 @@ __all__ = [
     "NotInSetConstraint",
     "SomeInSetConstraint",
     "SomeNotInSetConstraint",
+    "LinearExpr",
+    "OptimizationResult",
 ]
 
 
@@ -292,6 +298,108 @@ class Problem(object):
         if not domains:
             return iter(())
         return self._solver.getSolutionIter(domains, constraints, vconstraints)
+
+    def minimizeLexicographic(
+        self,
+        objectives,
+        all_solutions=False,
+        node_budget=None,
+        prune=True,
+        forwardcheck=True,
+    ):
+        """
+        Find solutions minimizing a sequence of objectives lexicographically
+
+        The first objective is the most important: among all solutions
+        minimizing it, the second objective is minimized, and so on.
+        This models, for instance, a scheduling rule that first minimizes
+        overtime and only then balances cost across equally good schedules.
+
+        Optimization is performed by a branch-and-bound search: at every
+        node the current (possibly forward-checked) domains are used to
+        compute a lower bound of each objective, and branches that cannot
+        improve on the best solution found so far are pruned. Solutions
+        are never collected before being compared.
+
+        Example:
+
+        >>> problem = Problem()
+        >>> problem.addVariables(["a", "b"], [1, 2, 3])
+        >>> problem.addConstraint(lambda a, b: a != b)
+        >>> overtime = LinearExpr({"a": 1, "b": -1})
+        >>> cost = LinearExpr({"a": 1, "b": 1}, constant=10)
+        >>> result = problem.minimizeLexicographic([overtime, cost])
+        >>> result.status == OptimizationResult.OPTIMAL
+        True
+        >>> result.objective_values
+        [-2, 14]
+        >>> result.solution == {"a": 1, "b": 3}
+        True
+
+        @param objectives: Sequence of integer linear expressions defining
+                           the lexicographic objective. Each item is either
+                           a L{LinearExpr} instance or a mapping of variables
+                           to integer coefficients. The order matters.
+        @type  objectives: sequence of L{LinearExpr} or dicts
+        @param all_solutions: Whether to return every optimal solution
+                              (default false, return a single solution)
+        @type  all_solutions: bool
+        @param node_budget: Maximum number of search nodes to expand.
+                            When exhausted, the search stops and the result
+                            status reports that the incumbent was not
+                            proven optimal. None means no limit.
+        @type  node_budget: int or None
+        @param prune: Whether lower-bound based pruning is enabled
+                      (default true)
+        @type  prune: bool
+        @param forwardcheck: Whether forward checking is performed while
+                             assigning variables (default true)
+        @type  forwardcheck: bool
+        @return: An L{OptimizationResult} describing the outcome. Its
+                 status distinguishes a proved optimum, an infeasible
+                 problem, and an exhausted node budget.
+        @rtype: L{OptimizationResult}
+        """
+        if not hasattr(objectives, "__getitem__") or isinstance(
+            objectives, string_types
+        ):
+            raise TypeError("objectives must be a sequence of expressions")
+        expressions = []
+        for objective in objectives:
+            if isinstance(objective, LinearExpr):
+                expressions.append(objective)
+            elif isinstance(objective, dict):
+                expressions.append(LinearExpr(objective))
+            else:
+                raise TypeError(
+                    "each objective must be a LinearExpr or a dict "
+                    "of coefficients"
+                )
+        if not expressions:
+            raise ValueError("at least one objective is required")
+        if node_budget is not None and (
+            isinstance(node_budget, bool)
+            or not isinstance(node_budget, int)
+            or node_budget <= 0
+        ):
+            raise ValueError("node_budget must be a positive integer or None")
+
+        domains, constraints, vconstraints = self._getArgs()
+        if not domains:
+            return OptimizationResult.infeasible()
+
+        solver = LexicographicBacktrackingSolver(
+            expressions,
+            prune=prune,
+            forwardcheck=forwardcheck,
+        )
+        return solver.solve(
+            domains,
+            constraints,
+            vconstraints,
+            all_solutions=all_solutions,
+            node_budget=node_budget,
+        )
 
     def _getArgs(self):
         domains = self._variables.copy()
@@ -664,6 +772,240 @@ class RecursiveBacktrackingSolver(Solver):
         return self.recursiveBacktracking([], domains, vconstraints, {}, False)
 
 
+class LexicographicBacktrackingSolver(Solver):
+    """
+    Branch-and-bound solver minimizing integer linear expressions
+
+    Expressions are minimized lexicographically: the first one has the
+    highest priority, the second one is used to break ties on the first,
+    and so on. At each search node the domains still available for the
+    unassigned variables provide a component-wise lower bound of every
+    objective. When the lower bound vector cannot improve on the best
+    solution found so far, the whole subtree is pruned.
+
+    Unlike collecting all solutions and sorting them afterwards, at most
+    the incumbent solutions are kept, so the full solution set is never
+    enumerated just to pick the optimum.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b"], [1, 2, 3])
+    >>> problem.addConstraint(lambda a, b: b > a, ["a", "b"])
+    >>> solver = LexicographicBacktrackingSolver(
+    ...     [LinearExpr({"a": 1}), LinearExpr({"b": 1})])
+    >>> domains, constraints, vconstraints = problem._getArgs()
+    >>> result = solver.solve(domains, constraints, vconstraints)
+    >>> result.solution
+    {'a': 1, 'b': 2}
+    """
+
+    def __init__(self, objectives, prune=True, forwardcheck=True):
+        """
+        @param objectives: Non-empty ordered sequence of L{LinearExpr}
+                           objects defining the lexicographic objective
+        @type  objectives: sequence of L{LinearExpr}
+        @param prune: Whether to prune branches whose lower bound cannot
+                      improve the incumbent (default true)
+        @type  prune: bool
+        @param forwardcheck: Whether forward checking should be requested
+                             to constraints during the search (default true)
+        @type  forwardcheck: bool
+        """
+        self._objectives = list(objectives)
+        self._prune = prune
+        self._forwardcheck = forwardcheck
+
+    def getSolution(self, domains, constraints, vconstraints):
+        result = self.solve(
+            domains, constraints, vconstraints, all_solutions=False
+        )
+        if result.status == OptimizationResult.INFEASIBLE:
+            return None
+        return result.solution
+
+    def getSolutions(self, domains, constraints, vconstraints):
+        result = self.solve(
+            domains, constraints, vconstraints, all_solutions=True
+        )
+        return result.solutions
+
+    def getSolutionIter(self, domains, constraints, vconstraints):
+        msg = "%s doesn't provide iteration" % self.__class__.__name__
+        raise NotImplementedError(msg)
+
+    def solve(
+        self,
+        domains,
+        constraints,
+        vconstraints,
+        all_solutions=False,
+        node_budget=None,
+    ):
+        """
+        Run the lexicographic branch-and-bound search
+
+        @param node_budget: Maximum number of nodes expanded (the root
+                            counts as one) or None for unlimited search
+        @type  node_budget: int or None
+        @return: L{OptimizationResult} with status OPTIMAL, INFEASIBLE,
+                 or BUDGET_EXHAUSTED
+        @rtype: L{OptimizationResult}
+        """
+        objectives = self._objectives
+        forwardcheck = self._forwardcheck
+        prune = self._prune
+        variables = list(domains.keys())
+
+        state = {
+            "nodes": 0,
+            "budget": node_budget,
+            "incumbent": None,
+            "solutions": [],
+            "exhausted": False,
+        }
+        assignments = {}
+
+        def evaluate(solution):
+            return [
+                objective.value(solution) for objective in objectives
+            ]
+
+        def lower_bounds():
+            return [
+                objective.lower_bound(assignments, domains)
+                for objective in objectives
+            ]
+
+        def cannot_improve(bounds, incumbent):
+            if incumbent is None or not prune:
+                return False
+            if all_solutions:
+                return _lex_greater(bounds, incumbent)
+            return not _lex_less(bounds, incumbent)
+
+        def remember(solution):
+            values = evaluate(solution)
+            incumbent = state["incumbent"]
+            if incumbent is None or _lex_less(values, incumbent):
+                state["incumbent"] = values
+                state["solutions"] = [dict(solution)]
+            elif all_solutions and values == incumbent:
+                state["solutions"].append(dict(solution))
+
+        def search():
+            state["nodes"] += 1
+            if (
+                state["budget"] is not None
+                and state["nodes"] > state["budget"]
+            ):
+                state["exhausted"] = True
+                raise _BudgetExhausted
+
+            unassigned = [
+                variable
+                for variable in variables
+                if variable not in assignments
+            ]
+            if not unassigned:
+                remember(assignments)
+                return
+
+            if cannot_improve(lower_bounds(), state["incumbent"]):
+                return
+
+            # Mix the Degree and Minimum Remaining Values (MRV) heuristics
+            variable = min(
+                unassigned,
+                key=lambda item: (
+                    -len(vconstraints[item]),
+                    len(domains[item]),
+                    item,
+                ),
+            )
+
+            if forwardcheck:
+                pushdomains = [
+                    domains[item]
+                    for item in variables
+                    if item not in assignments and item != variable
+                ]
+            else:
+                pushdomains = None
+
+            for value in domains[variable][:]:
+                assignments[variable] = value
+                if pushdomains:
+                    for domain in pushdomains:
+                        domain.pushState()
+                for constraint, constraint_vars in vconstraints[variable]:
+                    if not constraint(
+                        constraint_vars,
+                        domains,
+                        assignments,
+                        pushdomains,
+                    ):
+                        break
+                else:
+                    search()
+                if pushdomains:
+                    for domain in pushdomains:
+                        domain.popState()
+            del assignments[variable]
+
+        try:
+            search()
+        except _BudgetExhausted:
+            pass
+
+        values = state["incumbent"]
+        if values is None:
+            if state["exhausted"]:
+                return OptimizationResult.budget_exhausted(
+                    None, None, state["nodes"]
+                )
+            return OptimizationResult.infeasible()
+        if state["exhausted"]:
+            if all_solutions:
+                return OptimizationResult.budget_exhausted(
+                    None, list(state["solutions"]), state["nodes"], values
+                )
+            return OptimizationResult.budget_exhausted(
+                state["solutions"][0], None, state["nodes"], values
+            )
+        if all_solutions:
+            return OptimizationResult.optimal(
+                None, list(state["solutions"]), state["nodes"], values
+            )
+        return OptimizationResult.optimal(
+            state["solutions"][0], None, state["nodes"], values
+        )
+
+
+class _BudgetExhausted(Exception):
+    """Internal signal used to stop the search once the budget is spent"""
+
+
+def _lex_less(left, right):
+    """Return True if the left vector is lexicographically smaller"""
+    for left_value, right_value in zip(left, right):
+        if left_value < right_value:
+            return True
+        if left_value > right_value:
+            return False
+    return False
+
+
+def _lex_greater(left, right):
+    """Return True if the left vector is lexicographically larger"""
+    for left_value, right_value in zip(left, right):
+        if left_value > right_value:
+            return True
+        if left_value < right_value:
+            return False
+    return False
+
+
 class MinConflictsSolver(Solver):
     """
     Problem solver based on the minimum conflicts theory
@@ -829,6 +1171,220 @@ class Domain(list):
         """
         list.remove(self, value)
         self._hidden.append(value)
+
+
+# ----------------------------------------------------------------------
+# Optimization
+# ----------------------------------------------------------------------
+
+
+class LinearExpr(object):
+    """
+    Integer linear expression used as a lexicographic optimization objective
+
+    The expression has the form C{constant + sum(coeff[var] * var)} where
+    coefficients and the constant term are integers. Coefficients may be
+    negative, and variables not present in the coefficient mapping simply
+    do not contribute.
+
+    Example:
+
+    >>> overtime = LinearExpr({"a": 1, "b": -1}, constant=2)
+    >>> overtime.value({"a": 3, "b": 5})
+    0
+    >>> overtime.lower_bound({}, {"a": Domain([1, 2]), "b": Domain([4, 5])})
+    -2
+    """
+
+    def __init__(self, coefficients=None, constant=0):
+        """
+        @param coefficients: Mapping of variables to integer coefficients;
+                             absent variables have a zero coefficient
+        @type  coefficients: dict
+        @param constant: Constant integer term of the expression
+                         (default is zero)
+        @type  constant: int
+        """
+        coefficients = coefficients or {}
+        for variable, coefficient in coefficients.items():
+            if not isinstance(coefficient, int) or isinstance(
+                coefficient, bool
+            ):
+                raise ValueError("coefficients must be integers")
+        if not isinstance(constant, int) or isinstance(constant, bool):
+            raise ValueError("constant must be an integer")
+        self._coefficients = dict(coefficients)
+        self._constant = constant
+
+    @property
+    def coefficients(self):
+        """
+        Mapping of variables to their integer coefficients
+        """
+        return dict(self._coefficients)
+
+    @property
+    def constant(self):
+        """
+        Constant integer term of the expression
+        """
+        return self._constant
+
+    def value(self, assignments):
+        """
+        Evaluate the expression for a complete assignment
+
+        @param assignments: Mapping of variables to their values
+        @type  assignments: dict
+        @return: Integer value of the expression
+        @rtype: int
+        """
+        total = self._constant
+        for variable, coefficient in self._coefficients.items():
+            total += assignments[variable] * coefficient
+        return total
+
+    def lower_bound(self, assignments, domains):
+        """
+        Return the smallest value reachable from the current domains
+
+        Assigned variables contribute their current value, while each
+        unassigned variable contributes its best domain value (the
+        smallest one for a positive coefficient, the largest one for a
+        negative one). Forward checking, which removes values from
+        domains, therefore tightens the bound automatically.
+
+        @param assignments: Mapping of variables assigned so far
+        @type  assignments: dict
+        @param domains: Mapping of variables to their current domains
+        @type  domains: dict
+        @return: Integer lower bound of the expression
+        @rtype: int
+        """
+        total = self._constant
+        for variable, coefficient in self._coefficients.items():
+            if variable in assignments:
+                total += assignments[variable] * coefficient
+            else:
+                domain = domains[variable]
+                if coefficient >= 0:
+                    total += min(domain) * coefficient
+                else:
+                    total += max(domain) * coefficient
+        return total
+
+    def __repr__(self):
+        return "LinearExpr(%r, constant=%r)" % (
+            self._coefficients,
+            self._constant,
+        )
+
+
+class OptimizationResult(object):
+    """
+    Outcome of a lexicographic optimization run
+
+    Three situations are represented by distinct statuses:
+
+      - L{OPTIMAL}: the search completed and the returned solution or
+        solutions are proved optimal;
+      - L{INFEASIBLE}: the problem has no solution;
+      - L{BUDGET_EXHAUSTED}: the node budget ran out. In that case
+        L{solution}/L{solutions} hold the best incumbent found so far
+        (possibly none), but it is explicitly not proved optimal.
+
+    Example:
+
+    >>> result = OptimizationResult.optimal({"a": 1}, None, 3, [0])
+    >>> result.status == OptimizationResult.OPTIMAL
+    True
+    >>> result.is_optimal
+    True
+    """
+
+    OPTIMAL = "optimal"
+    INFEASIBLE = "infeasible"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+
+    def __init__(
+        self,
+        status,
+        solution=None,
+        solutions=None,
+        nodes=0,
+        objective_values=None,
+    ):
+        self.status = status
+        self.solution = solution
+        self.solutions = solutions
+        self.nodes = nodes
+        self.objective_values = objective_values
+
+    @classmethod
+    def optimal(cls, solution, solutions, nodes, objective_values):
+        """
+        Build a result for a completed search with proved optimum
+        """
+        return cls(cls.OPTIMAL, solution, solutions, nodes, objective_values)
+
+    @classmethod
+    def infeasible(cls):
+        """
+        Build a result for a problem without any solution
+        """
+        return cls(cls.INFEASIBLE)
+
+    @classmethod
+    def budget_exhausted(
+        cls, solution, solutions, nodes, objective_values=None
+    ):
+        """
+        Build a result for a search stopped by the node budget
+
+        The incumbent, if any, is the best solution found within the
+        budget but is not known to be a global optimum.
+        """
+        return cls(
+            cls.BUDGET_EXHAUSTED,
+            solution,
+            solutions,
+            nodes,
+            objective_values,
+        )
+
+    @property
+    def is_optimal(self):
+        """
+        True if the returned solution or solutions were proved optimal
+        """
+        return self.status == self.OPTIMAL
+
+    @property
+    def is_infeasible(self):
+        """
+        True if no solution exists
+        """
+        return self.status == self.INFEASIBLE
+
+    @property
+    def is_budget_exhausted(self):
+        """
+        True if the node budget ran out before optimality was proved
+        """
+        return self.status == self.BUDGET_EXHAUSTED
+
+    def __repr__(self):
+        return (
+            "OptimizationResult(status=%r, solution=%r, solutions=%r, "
+            "nodes=%r, objective_values=%r)"
+            % (
+                self.status,
+                self.solution,
+                self.solutions,
+                self.nodes,
+                self.objective_values,
+            )
+        )
 
 
 # ----------------------------------------------------------------------
