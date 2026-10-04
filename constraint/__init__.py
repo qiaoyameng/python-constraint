@@ -34,6 +34,7 @@
 @group Constraints: Constraint,
                     FunctionConstraint,
                     AllDifferentConstraint,
+                    AllDifferentMatchingConstraint,
                     AllEqualConstraint,
                     MaxSumConstraint,
                     ExactSumConstraint,
@@ -72,6 +73,7 @@ __all__ = [
     "Constraint",
     "FunctionConstraint",
     "AllDifferentConstraint",
+    "AllDifferentMatchingConstraint",
     "AllEqualConstraint",
     "MaxSumConstraint",
     "ExactSumConstraint",
@@ -1031,6 +1033,221 @@ class AllDifferentConstraint(Constraint):
                             if not domain:
                                 return False
         return True
+
+
+def _strongly_connected_components(nodes, successors):
+    """
+    Tarjan's algorithm (iterative) for strongly connected components
+
+    @param nodes: Iterable of graph nodes
+    @param successors: Callable mapping a node to its outgoing edges
+    @return: Dictionary mapping each node to its component representative
+    @rtype: dict
+    """
+    index = {}
+    lowlink = {}
+    component = {}
+    stack = []
+    on_stack = set()
+    counter = 0
+    for root in nodes:
+        if root in index:
+            continue
+        index[root] = lowlink[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        work = [(root, iter(successors(root)))]
+        while work:
+            node, iterator = work[-1]
+            for nxt in iterator:
+                if nxt not in index:
+                    index[nxt] = lowlink[nxt] = counter
+                    counter += 1
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, iter(successors(nxt))))
+                    break
+                elif nxt in on_stack and index[nxt] < lowlink[node]:
+                    lowlink[node] = index[nxt]
+            else:
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    if lowlink[node] < lowlink[parent]:
+                        lowlink[parent] = lowlink[node]
+                if lowlink[node] == index[node]:
+                    while True:
+                        member = stack.pop()
+                        on_stack.discard(member)
+                        component[member] = node
+                        if member == node:
+                            break
+    return component
+
+
+def _matching_support(variables, domains, assignments):
+    """
+    Compute values taking part in at least one complete matching
+
+    Builds the bipartite support graph between the given variables and
+    their candidate values (assigned variables contribute their current
+    value as a singleton), finds a maximum matching, and then determines
+    which edges belong to some maximum matching: matched edges, edges on
+    an alternating path starting at a free value, and edges on an
+    alternating cycle (Régin's filtering for AllDifferent).
+
+    @param variables: Variables affected by the constraint
+    @type  variables: sequence
+    @param domains: Dictionary mapping variables to their domains
+    @type  domains: dict
+    @param assignments: Dictionary with the current variable assignments
+    @type  assignments: dict
+    @return: Dictionary mapping each variable to the set of its supported
+             values, or None if no matching covers all variables
+    @rtype: dict or None
+    """
+    neighbors = {}
+    value_to_variables = {}
+    for variable in variables:
+        if variable in assignments:
+            candidates = (assignments[variable],)
+        else:
+            candidates = domains[variable]
+        neighbors[variable] = list(candidates)
+        for value in candidates:
+            value_to_variables.setdefault(value, []).append(variable)
+
+    # Maximum bipartite matching via augmenting paths (Kuhn's algorithm).
+    match_variable = {}
+    match_value = {}
+
+    def augment(variable, seen):
+        for value in neighbors[variable]:
+            if value not in seen:
+                seen.add(value)
+                if value not in match_value or augment(match_value[value], seen):
+                    match_variable[variable] = value
+                    match_value[value] = variable
+                    return True
+        return False
+
+    for variable in variables:
+        augment(variable, set())
+    if len(match_variable) < len(variables):
+        return None
+
+    # Directed matching graph: matched edges go from variable nodes to
+    # value nodes, unmatched edges from value nodes to variable nodes.
+    # Nodes are tagged so that variables and values never collide.
+    def successors(node):
+        kind, obj = node
+        if kind == 0:
+            return ((1, match_variable[obj]),)
+        return tuple(
+            (0, variable)
+            for variable in value_to_variables[obj]
+            if match_variable[variable] != obj
+        )
+
+    # Edges on an alternating path starting at a free (unmatched) value.
+    reachable = set()
+    queue = [
+        (1, value) for value in value_to_variables if value not in match_value
+    ]
+    while queue:
+        node = queue.pop()
+        if node in reachable:
+            continue
+        reachable.add(node)
+        queue.extend(successors(node))
+
+    # Edges on an alternating cycle link nodes of the same component.
+    nodes = [(0, variable) for variable in variables]
+    nodes.extend((1, value) for value in value_to_variables)
+    component = _strongly_connected_components(nodes, successors)
+
+    support = {}
+    for variable in variables:
+        node = (0, variable)
+        matched = match_variable[variable]
+        keep = set()
+        for value in neighbors[variable]:
+            if (
+                value == matched
+                or (1, value) in reachable
+                or component[(1, value)] == component[node]
+            ):
+                keep.add(value)
+        support[variable] = keep
+    return support
+
+
+class AllDifferentMatchingConstraint(Constraint):
+    """
+    Constraint enforcing that values of all given variables are different,
+    propagating through bipartite matching
+
+    Unlike L{AllDifferentConstraint}, which only reacts to values already
+    assigned, this constraint builds the variable/value support graph on
+    every check, computes a maximum matching, and removes candidate values
+    that cannot take part in any complete matching. Hall-set conflicts
+    (more variables than distinct candidate values in some subset) are
+    therefore detected before variables are assigned, and infeasible
+    branches are pruned as soon as domain changes make them apparent.
+
+    A value is only removed when it belongs to no maximum matching at
+    all; simply not being used by the particular matching that was found
+    is never a reason for removal. All pruning done while searching goes
+    through the domain state stack, so it is undone when the search
+    backtracks and never leaks into sibling branches.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["shift1", "shift2", "shift3"], ["ann", "bob"])
+    >>> problem.addConstraint(AllDifferentMatchingConstraint())
+    >>> problem.getSolution() is None
+    True
+
+    >>> problem = Problem()
+    >>> problem.addVariable("a", [1, 2])
+    >>> problem.addVariable("b", [1, 2])
+    >>> problem.addVariable("c", [1, 2, 3])
+    >>> problem.addConstraint(AllDifferentMatchingConstraint())
+    >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+    [[('a', 1), ('b', 2), ('c', 3)], [('a', 2), ('b', 1), ('c', 3)]]
+    """
+
+    def __call__(self, variables, domains, assignments, forwardcheck=False):
+        support = _matching_support(variables, domains, assignments)
+        if support is None:
+            return False
+        if forwardcheck:
+            for variable in variables:
+                if variable not in assignments:
+                    domain = domains[variable]
+                    keep = support[variable]
+                    for value in domain[:]:
+                        if value not in keep:
+                            domain.hideValue(value)
+                    if not domain:
+                        return False
+        return True
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        support = _matching_support(variables, domains, {})
+        if support is None:
+            # No matching covers all variables: the constraint can never
+            # be satisfied, so report an empty domain before searching.
+            del domains[variables[0]][:]
+            return
+        for variable in variables:
+            domain = domains[variable]
+            keep = support[variable]
+            for value in domain[:]:
+                if value not in keep:
+                    domain.remove(value)
 
 
 class AllEqualConstraint(Constraint):
