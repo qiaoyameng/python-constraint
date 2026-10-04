@@ -33,6 +33,7 @@
                 MinConflictsSolver
 @group Constraints: Constraint,
                     FunctionConstraint,
+                    ReifiedConstraint,
                     AllDifferentConstraint,
                     AllEqualConstraint,
                     MaxSumConstraint,
@@ -71,6 +72,7 @@ __all__ = [
     "MinConflictsSolver",
     "Constraint",
     "FunctionConstraint",
+    "ReifiedConstraint",
     "AllDifferentConstraint",
     "AllEqualConstraint",
     "MaxSumConstraint",
@@ -227,6 +229,40 @@ class Problem(object):
                 msg = "Constraints must be instances of subclasses " "of the Constraint class"
                 raise ValueError(msg)
         self._constraints.append((constraint, variables))
+
+    def addReifiedConstraint(self, constraint, boolvar, variables):
+        """
+        Add a constraint linking a boolean variable to the truth value
+        of another constraint
+
+        The boolean variable is true for a given assignment exactly
+        when the given constraint holds for the given variables, and
+        false exactly when the negation of the whole relation holds.
+
+        Example:
+
+        >>> problem = Problem()
+        >>> problem.addVariables(["a", "b"], [1, 2])
+        >>> problem.addVariable("flag", [False, True])
+        >>> problem.addReifiedConstraint(lambda a, b: a < b, "flag", ["a", "b"])
+        >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+        [[('a', 1), ('b', 1), ('flag', False)], [('a', 1), ('b', 2), ('flag', True)], [('a', 2), ('b', 1), ('flag', False)], [('a', 2), ('b', 2), ('flag', False)]]
+
+        @param constraint: Constraint to be reified
+        @type  constraint: instance of a L{Constraint} subclass or a
+                           function to be wrapped by L{FunctionConstraint}
+        @param boolvar: Variable reflecting whether the constraint holds
+        @type  boolvar: hashable object
+        @param variables: Variables affected by the reified constraint
+        @type  variables: sequence of variables
+        """
+        if not isinstance(constraint, Constraint):
+            if callable(constraint):
+                constraint = FunctionConstraint(constraint)
+            else:
+                msg = "Constraints must be instances of subclasses " "of the Constraint class"
+                raise ValueError(msg)
+        self.addConstraint(ReifiedConstraint(constraint), list(variables) + [boolvar])
 
     def getSolution(self):
         """
@@ -991,6 +1027,128 @@ class FunctionConstraint(Constraint):
                 self.forwardCheck(variables, domains, assignments)
             )
         return self._func(*parms)
+
+
+class ReifiedConstraint(Constraint):
+    """
+    Constraint linking a boolean variable to the truth value of
+    another constraint
+
+    The reified constraint is satisfied when the boolean variable is
+    true exactly if the wrapped constraint holds for the remaining
+    variables. While a partial assignment is not enough to decide
+    whether the wrapped constraint holds or not, both boolean values
+    remain possible. When the boolean variable is false, the negation
+    of the wrapped relation as a whole is enforced, rather than a
+    item-by-item negation.
+
+    The wrapped constraint may be any built-in constraint able to
+    check complete assignments (such as L{AllEqualConstraint},
+    L{AllDifferentConstraint}, L{MaxSumConstraint},
+    L{ExactSumConstraint}, and L{MinSumConstraint}) or a
+    L{FunctionConstraint} wrapping a user function. User functions
+    are only ever called with complete assignments, and never receive
+    L{Unassigned} values.
+
+    The boolean variable must be the last one in the variable list.
+    L{Problem.addReifiedConstraint} is a convenient way to ensure
+    that.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b"], [1, 2])
+    >>> problem.addVariable("flag", [False, True])
+    >>> problem.addReifiedConstraint(AllDifferentConstraint(), "flag", ["a", "b"])
+    >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+    [[('a', 1), ('b', 1), ('flag', False)], [('a', 1), ('b', 2), ('flag', True)], [('a', 2), ('b', 1), ('flag', True)], [('a', 2), ('b', 2), ('flag', False)]]
+    """
+
+    def __init__(self, constraint):
+        """
+        @param constraint: Constraint whose truth value is linked to
+                           the boolean variable
+        @type  constraint: instance of a L{Constraint} subclass
+        """
+        self._constraint = constraint
+
+    def __call__(self, variables, domains, assignments, forwardcheck=False):
+        inner = self._constraint
+        ivars = variables[:-1]
+        bvar = variables[-1]
+        if bvar in assignments:
+            want = bool(assignments[bvar])
+        else:
+            want = None
+        unassigned = [variable for variable in ivars if variable not in assignments]
+        if not unassigned:
+            # Complete assignment: the exact truth value is known.
+            holds = bool(inner(ivars, domains, assignments))
+            if want is None:
+                return self._propagateBool(bvar, holds, domains, forwardcheck)
+            return holds == want
+        if len(unassigned) == 1:
+            # A single undecided variable: try each of its values on a
+            # complete assignment to learn where the relation holds.
+            uvar = unassigned[0]
+            udomain = domains[uvar]
+            holdsfor = []
+            failsfor = []
+            for value in udomain:
+                assignments[uvar] = value
+                if inner(ivars, domains, assignments):
+                    holdsfor.append(value)
+                else:
+                    failsfor.append(value)
+            del assignments[uvar]
+            if not failsfor:
+                status = True
+            elif not holdsfor:
+                status = False
+            else:
+                status = None
+            if want is None:
+                if status is None:
+                    return True
+                return self._propagateBool(bvar, status, domains, forwardcheck)
+            if status is not None:
+                return status == want
+            # The undecided variable alone decides the outcome. Keep
+            # only the values matching the required truth value.
+            if forwardcheck:
+                for value in failsfor if want else holdsfor:
+                    udomain.hideValue(value)
+                if not udomain:
+                    return False
+            return True
+        # More than one unassigned variable: the outcome cannot be
+        # decided from complete assignments alone. Partial queries are
+        # only safe for built-in constraints, since user functions
+        # must never be fed Unassigned values.
+        if isinstance(inner, FunctionConstraint):
+            return True
+        if want is None:
+            if not inner(ivars, domains, assignments):
+                return self._propagateBool(bvar, False, domains, forwardcheck)
+            return True
+        if want:
+            return bool(inner(ivars, domains, assignments, forwardcheck))
+        # The negation of the whole relation can only be refuted once
+        # more variables are assigned, so both possibilities remain.
+        return True
+
+    @staticmethod
+    def _propagateBool(bvar, required, domains, forwardcheck):
+        domain = domains[bvar]
+        if forwardcheck:
+            for value in domain[:]:
+                if bool(value) != required:
+                    domain.hideValue(value)
+            return bool(domain)
+        for value in domain:
+            if bool(value) == required:
+                return True
+        return False
 
 
 class AllDifferentConstraint(Constraint):
