@@ -109,6 +109,7 @@ Predefined constraint types currently available:
 - :python:`FunctionConstraint`
 - :python:`AllDifferentConstraint`
 - :python:`AllEqualConstraint`
+- :python:`LexLeaderConstraint`
 - :python:`ExactSumConstraint`
 - :python:`MaxSumConstraint`
 - :python:`MinSumConstraint`
@@ -116,6 +117,42 @@ Predefined constraint types currently available:
 - :python:`NotInSetConstraint`
 - :python:`SomeInSetConstraint`
 - :python:`SomeNotInSetConstraint`
+
+Symmetry breaking
+-----------------
+
+When several variables are interchangeable (for instance, six identical
+slots which differ only by their names), every solution is enumerated
+once per permutation of those variables. :python:`LexLeaderConstraint`
+breaks such symmetries declared by the caller: for each declared
+variable permutation, the assignment vector (taken in the order the
+variables are given to :python:`addConstraint`) must be
+lexicographically smaller than or equal to its permuted image.
+
+.. code-block:: python
+
+    >>> from constraint import Problem, LexLeaderConstraint
+    >>> problem = Problem()
+    >>> slots = ["slot1", "slot2"]
+    >>> problem.addVariables(slots, [1, 2])
+    >>> swap = {"slot1": "slot2", "slot2": "slot1"}
+    >>> problem.addConstraint(LexLeaderConstraint([swap]), slots)
+    >>> problem.getSolutions()
+    [{'slot1': 2, 'slot2': 2}, {'slot1': 1, 'slot2': 1}, {'slot1': 1, 'slot2': 2}]
+
+Symmetry is never guessed from variable names: only explicitly declared
+permutations are used. Each permutation must be complete and one-to-one
+over the declared variables, and permuted variables must have identical
+domains; otherwise :python:`ValueError` is raised when solving, and the
+caller must revoke or fix the declaration. Valid answers are never
+silently dropped.
+
+Note the difference between declaring generating permutations and
+declaring the full permutation group: constraining the images under a
+set of generators keeps at least one representative of each symmetry
+orbit, but may keep more than one. Only constraining the images under
+every element of the full group guarantees exactly one representative
+per orbit.
 
 API documentation
 -----------------

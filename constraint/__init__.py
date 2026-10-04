@@ -35,6 +35,7 @@
                     FunctionConstraint,
                     AllDifferentConstraint,
                     AllEqualConstraint,
+                    LexLeaderConstraint,
                     MaxSumConstraint,
                     ExactSumConstraint,
                     MinSumConstraint,
@@ -73,6 +74,7 @@ __all__ = [
     "FunctionConstraint",
     "AllDifferentConstraint",
     "AllEqualConstraint",
+    "LexLeaderConstraint",
     "MaxSumConstraint",
     "ExactSumConstraint",
     "MinSumConstraint",
@@ -1070,6 +1072,207 @@ class AllEqualConstraint(Constraint):
                     for value in domain[:]:
                         if value != singlevalue:
                             domain.hideValue(value)
+        return True
+
+
+class LexLeaderConstraint(Constraint):
+    """
+    Constraint breaking symmetries declared through variable permutations
+
+    When several variables are interchangeable (for instance, identical
+    slots which differ only by their names), every solution has symmetric
+    counterparts which merely permute the values of those variables, and
+    all of them get enumerated. This constraint discards such counterparts
+    by requiring the assignment vector, taken in the order the variables
+    are given to L{Problem.addConstraint}, to be lexicographically smaller
+    than or equal to each of its permuted images.
+
+    Symmetry is never guessed from variable names: only the permutations
+    explicitly declared by the caller are used. Each permutation must be
+    complete (it must mention every variable of the constraint, both as a
+    key and as a value) and one-to-one, and variables swapped by a
+    permutation must have identical domains. If a declaration is invalid,
+    C{ValueError} is raised when the problem is solved, asking the caller
+    to revoke or fix the declaration; valid answers are never silently
+    dropped.
+
+    Note that constraining the images under a set of generating
+    permutations is weaker than constraining the images under the full
+    permutation group they generate. Generator-wise constraints keep at
+    least one representative of each symmetry orbit, but may keep more
+    than one. Only declaring every element of the full group guarantees
+    that a single representative per orbit is returned.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b"], [1, 2])
+    >>> permutation = {"a": "b", "b": "a"}
+    >>> problem.addConstraint(LexLeaderConstraint([permutation]), ["a", "b"])
+    >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+    [[('a', 1), ('b', 1)], [('a', 1), ('b', 2)], [('a', 2), ('b', 2)]]
+    """
+
+    def __init__(self, permutations, value_order=None):
+        """
+        @param permutations: Sequence of dictionaries, each mapping every
+                             variable of the constraint to the variable
+                             taking its place. Each dictionary must be a
+                             complete one-to-one permutation of the
+                             declared variables.
+        @type  permutations: sequence of dicts
+        @param value_order: Optional explicit ordering of the domain
+                            values, from smallest to largest, used for
+                            the lexicographic comparison. When not given,
+                            values are compared with their natural
+                            ordering.
+        @type  value_order: sequence
+        """
+        self._permutations = [dict(permutation) for permutation in permutations]
+        for permutation in self._permutations:
+            if set(permutation.values()) != set(permutation):
+                msg = (
+                    "Permutations must be complete and one-to-one, "
+                    "mapping the variable set onto itself: %r" % (permutation,)
+                )
+                raise ValueError(msg)
+        self._ranks = None
+        if value_order is not None:
+            self._ranks = {}
+            for rank, value in enumerate(value_order):
+                if value in self._ranks:
+                    msg = "Duplicated value in explicit value order: %r" % (value,)
+                    raise ValueError(msg)
+                self._ranks[value] = rank
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        if len(set(variables)) != len(variables):
+            msg = "Variables of a LexLeaderConstraint must not repeat: %r"
+            raise ValueError(msg % (variables,))
+        declared = set(variables)
+        for permutation in self._permutations:
+            if set(permutation) != declared:
+                msg = (
+                    "Permutation %r does not mention exactly the declared "
+                    "variables %r; revoke the symmetry declaration or fix "
+                    "the permutation" % (permutation, list(variables))
+                )
+                raise ValueError(msg)
+            for variable in variables:
+                domain = domains[variable]
+                imagedomain = domains[permutation[variable]]
+                if len(domain) != len(imagedomain) or any(
+                    value not in imagedomain for value in domain
+                ):
+                    msg = (
+                        "Variables %r and %r were declared interchangeable "
+                        "but their domains differ; revoke the symmetry "
+                        "declaration or make the domains identical"
+                        % (variable, permutation[variable])
+                    )
+                    raise ValueError(msg)
+        if self._ranks is not None:
+            for variable in variables:
+                for value in domains[variable]:
+                    if value not in self._ranks:
+                        msg = (
+                            "Value %r of variable %r is missing from the "
+                            "explicit value order" % (value, variable)
+                        )
+                        raise ValueError(msg)
+
+    def _compare(self, value1, value2):
+        if self._ranks is not None:
+            value1 = self._ranks[value1]
+            value2 = self._ranks[value2]
+        return (value1 > value2) - (value1 < value2)
+
+    def _domain_extreme(self, domain, extreme):
+        if self._ranks is not None:
+            return extreme(domain, key=self._ranks.__getitem__)
+        return extreme(domain)
+
+    def __call__(
+        self,
+        variables,
+        domains,
+        assignments,
+        forwardcheck=False,
+        _unassigned=Unassigned,
+    ):
+        for permutation in self._permutations:
+            if not self._check_permutation(
+                permutation, variables, domains, assignments, forwardcheck,
+                _unassigned,
+            ):
+                return False
+        return True
+
+    def _check_permutation(
+        self, permutation, variables, domains, assignments, forwardcheck,
+        _unassigned,
+    ):
+        for variable in variables:
+            image = permutation[variable]
+            value = assignments.get(variable, _unassigned)
+            imagevalue = assignments.get(image, _unassigned)
+            if value is _unassigned or imagevalue is _unassigned:
+                # First position of the vector which is not certainly
+                # equal to its image: the comparison cannot be decided
+                # beyond this point yet, but forward checking may still
+                # prune values which can never satisfy it.
+                if forwardcheck:
+                    return self._forwardcheck_position(
+                        variable, image, domains, assignments, _unassigned
+                    )
+                return True
+            comparison = self._compare(value, imagevalue)
+            if comparison < 0:
+                # The vector is already smaller than its image.
+                return True
+            if comparison > 0:
+                return False
+            # Equal prefix so far: keep scanning the remaining positions.
+        return True
+
+    def _forwardcheck_position(
+        self, variable, image, domains, assignments, _unassigned
+    ):
+        value = assignments.get(variable, _unassigned)
+        imagevalue = assignments.get(image, _unassigned)
+        if value is _unassigned and imagevalue is _unassigned:
+            if variable == image:
+                return True
+            domain = domains[variable]
+            imagedomain = domains[image]
+            if not domain or not imagedomain:
+                return False
+            # Keep only values which may still be ordered consistently
+            # with the values remaining on the other side.
+            maximage = self._domain_extreme(imagedomain, max)
+            minvalue = self._domain_extreme(domain, min)
+            for candidate in domain[:]:
+                if self._compare(candidate, maximage) > 0:
+                    domain.hideValue(candidate)
+            for candidate in imagedomain[:]:
+                if self._compare(candidate, minvalue) < 0:
+                    imagedomain.hideValue(candidate)
+            if not domain or not imagedomain:
+                return False
+        elif imagevalue is _unassigned:
+            imagedomain = domains[image]
+            for candidate in imagedomain[:]:
+                if self._compare(value, candidate) > 0:
+                    imagedomain.hideValue(candidate)
+            if not imagedomain:
+                return False
+        else:
+            domain = domains[variable]
+            for candidate in domain[:]:
+                if self._compare(candidate, imagevalue) > 0:
+                    domain.hideValue(candidate)
+            if not domain:
+                return False
         return True
 
 

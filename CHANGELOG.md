@@ -5,6 +5,14 @@
 All notable changes to this code base will be documented in this file,
 in every released version.
 
+### Unreleased
+
+- Issues/Enhancements:
+  - Add `LexLeaderConstraint` for breaking symmetries declared by the
+    caller through variable permutations, with lexicographic-leader
+    constraints, optional explicit value ordering, and validation of
+    the declared permutations and domain interchangeability
+
 ### Version 1.4.0
 
 - Released: 2018-11-05
