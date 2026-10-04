@@ -38,6 +38,7 @@
                     MaxSumConstraint,
                     ExactSumConstraint,
                     MinSumConstraint,
+                    TableConstraint,
                     InSetConstraint,
                     NotInSetConstraint,
                     SomeInSetConstraint,
@@ -76,6 +77,7 @@ __all__ = [
     "MaxSumConstraint",
     "ExactSumConstraint",
     "MinSumConstraint",
+    "TableConstraint",
     "InSetConstraint",
     "NotInSetConstraint",
     "SomeInSetConstraint",
@@ -787,6 +789,14 @@ class Domain(list):
         list.__init__(self, set)
         self._hidden = []
         self._states = []
+        self._table_states = {}
+
+    def __copy__(self):
+        domain = type(self)(self)
+        domain._hidden = list(self._hidden)
+        domain._states = list(self._states)
+        domain._table_states = {}
+        return domain
 
     def resetState(self):
         """
@@ -814,8 +824,11 @@ class Domain(list):
         """
         diff = self._states.pop() - len(self)
         if diff:
-            self.extend(self._hidden[-diff:])
+            restored = self._hidden[-diff:]
+            self.extend(restored)
             del self._hidden[-diff:]
+            for listener in self._table_states.values():
+                listener.valuesRestored(restored)
 
     def hideValue(self, value):
         """
@@ -829,6 +842,13 @@ class Domain(list):
         """
         list.remove(self, value)
         self._hidden.append(value)
+        for listener in self._table_states.values():
+            listener.valueHidden(value)
+
+    def remove(self, value):
+        list.remove(self, value)
+        for listener in self._table_states.values():
+            listener.valueHidden(value)
 
 
 # ----------------------------------------------------------------------
@@ -1289,6 +1309,298 @@ class MinSumConstraint(Constraint):
             if type(sum) is float:
                 sum = round(sum, 10)
             return sum >= minsum
+
+
+class TableConstraint(Constraint):
+    """
+    Constraint enforcing that variables assume one of the given tuples.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b"], [1, 2, 3])
+    >>> problem.addConstraint(TableConstraint([(1, 2), (3, 3)]), ["a", "b"])
+    >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+    [[('a', 1), ('b', 2)], [('a', 3), ('b', 3)]]
+    """
+
+    def __init__(self, rows):
+        """
+        @param rows: Allowed tuples, in the same order as the variables
+        @type rows: sequence of sequences
+        """
+        self._rows = []
+        seen = set()
+        arity = None
+        for row in rows:
+            row = tuple(row)
+            if arity is None:
+                arity = len(row)
+            elif len(row) != arity:
+                msg = "Row %s has %d values, expected %d" % (
+                    row,
+                    len(row),
+                    arity,
+                )
+                raise ValueError(msg)
+            if row not in seen:
+                seen.add(row)
+                self._rows.append(row)
+
+    def _buildSupports(self, arity=None):
+        if arity is None:
+            arity = len(self._rows[0]) if self._rows else 0
+        supports = [{} for _column in range(arity)]
+        for row_id, row in enumerate(self._rows):
+            for column, value in enumerate(row):
+                supports[column].setdefault(value, set()).add(row_id)
+        return supports
+
+    def _getState(self, variables, domains):
+        listener_key = (id(self), variables)
+        for variable in dict.fromkeys(variables):
+            listener = domains[variable]._table_states.get(listener_key)
+            if listener is not None:
+                return listener.state
+        return None
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        arity = len(variables)
+        for row in self._rows:
+            if len(row) != arity:
+                msg = "Row %s has %d values, expected %d" % (
+                    row,
+                    len(row),
+                    arity,
+                )
+                raise ValueError(msg)
+        for variable in dict.fromkeys(variables):
+            domains[variable].resetState()
+
+        if arity == 1:
+            Constraint.preProcess(
+                self, variables, domains, constraints, vconstraints
+            )
+            return
+        variable_tuple = tuple(variables)
+
+        supports = self._buildSupports(arity)
+        state = _TableConstraintState(self, variable_tuple, domains, supports)
+        listener_key = (id(self), variable_tuple)
+        listeners = []
+        columns_by_variable = {}
+        for column, variable in enumerate(variables):
+            columns_by_variable.setdefault(variable, []).append(column)
+        for variable, columns in columns_by_variable.items():
+            domain = domains[variable]
+            old_listener = domain._table_states.pop(listener_key, None)
+            if old_listener is not None:
+                old_listener.detach()
+            listener = _TableDomainListener(state, variable, columns)
+            domain._table_states[listener_key] = listener
+            listeners.append(listener)
+
+        changed = True
+        while changed:
+            changed = False
+            for variable in columns_by_variable:
+                domain = domains[variable]
+                for value in domain[:]:
+                    if not state.supportsValue(variable, value):
+                        domain.remove(value)
+                        changed = True
+
+        if not all(domains[variable] for variable in columns_by_variable):
+            for variable in columns_by_variable:
+                domains[variable]._table_states.pop(listener_key, None)
+
+    def __call__(
+        self,
+        variables,
+        domains,
+        assignments,
+        forwardcheck=False,
+        _unassigned=Unassigned,
+    ):
+        variables = tuple(variables)
+        state = self._getState(variables, domains)
+        supports = (
+            state.supports
+            if state is not None
+            else self._buildSupports(len(variables))
+        )
+        candidates = None
+
+        for column, variable in enumerate(variables):
+            if variable not in assignments:
+                continue
+            value = assignments[variable]
+            matches = supports[column].get(value, set()).copy()
+            for other_column in range(column):
+                if variables[other_column] == variable:
+                    matches &= supports[other_column].get(value, set())
+            candidates = matches if candidates is None else candidates & matches
+            if not candidates:
+                return False
+
+        if forwardcheck:
+            unassigned = [
+                variable
+                for variable in dict.fromkeys(variables)
+                if variable not in assignments
+            ]
+            if unassigned:
+                if state is None:
+                    state = _TableConstraintState(
+                        self, variables, domains, supports
+                    )
+
+                active = state.active
+                if candidates is None:
+                    candidates = set(active)
+                else:
+                    candidates &= active
+                if not candidates:
+                    return False
+
+                columns_by_variable = state.columns_by_variable
+                allowed = dict((variable, set()) for variable in unassigned)
+                state.candidate_accesses = 0
+                for row_id in candidates & state.active:
+                    state.candidate_accesses += 1
+                    row = self._rows[row_id]
+                    for variable in unassigned:
+                        columns = columns_by_variable[variable]
+                        value = row[columns[0]]
+                        if all(row[column] == value for column in columns):
+                            allowed[variable].add(value)
+
+                for variable in unassigned:
+                    domain = domains[variable]
+                    for value in domain[:]:
+                        if value not in allowed[variable]:
+                            domain.hideValue(value)
+                    if not domain:
+                        return False
+
+            return True
+
+        if candidates is None:
+            return True
+        return bool(candidates)
+
+
+class _TableDomainListener(object):
+
+    def __init__(self, state, variable, columns):
+        self.state = state
+        self.variable = variable
+        self.columns = tuple(columns)
+
+    def valueHidden(self, value):
+        self.state.valueRemoved(self.variable, value, self.columns)
+
+    def valuesRestored(self, values):
+        self.state.valuesRestored(self.variable, values, self.columns)
+
+    def detach(self):
+        self.state = None
+
+
+class _TableConstraintState(object):
+
+    def __init__(self, constraint, variables, domains, supports):
+        self.constraint = constraint
+        self.supports = supports
+        self.variables = tuple(variables)
+        self.columns_by_variable = {}
+        for column, variable in enumerate(self.variables):
+            self.columns_by_variable.setdefault(variable, []).append(column)
+
+        self.missing = {}
+        self.support_counts = dict(
+            (variable, {}) for variable in self.columns_by_variable
+        )
+        self.active = set()
+        self.inconsistent = set()
+        self.candidate_accesses = 0
+
+        for row_id, row in enumerate(constraint._rows):
+            missing = 0
+            for variable, columns in self.columns_by_variable.items():
+                value = row[columns[0]]
+                if not all(row[column] == value for column in columns):
+                    self.inconsistent.add(row_id)
+                    break
+                if value not in domains[variable]:
+                    missing += 1
+            if row_id in self.inconsistent:
+                continue
+            elif missing:
+                self.missing[row_id] = missing
+            else:
+                self._activate(row_id)
+
+    def _activate(self, row_id):
+        self.active.add(row_id)
+        row = self.constraint._rows[row_id]
+        for variable, columns in self.columns_by_variable.items():
+            value = row[columns[0]]
+            if all(row[column] == value for column in columns):
+                counts = self.support_counts[variable]
+                counts[value] = counts.get(value, 0) + 1
+
+    def _deactivate(self, row_id):
+        self.active.remove(row_id)
+        row = self.constraint._rows[row_id]
+        for variable, columns in self.columns_by_variable.items():
+            value = row[columns[0]]
+            if all(row[column] == value for column in columns):
+                counts = self.support_counts[variable]
+                counts[value] -= 1
+
+    def supportsValue(self, variable, value):
+        return self.support_counts[variable].get(value, 0) > 0
+
+    def _affectedRows(self, columns, value):
+        rows = set()
+        for column in columns:
+            rows.update(self.supports[column].get(value, ()))
+        return rows
+
+    def valueRemoved(self, variable, value, columns=None):
+        if columns is None:
+            columns = self.columns_by_variable[variable]
+        for row_id in self._affectedRows(columns, value):
+            if row_id in self.inconsistent:
+                continue
+            row = self.constraint._rows[row_id]
+            if not any(row[column] == value for column in columns):
+                continue
+            if row_id in self.active:
+                self._deactivate(row_id)
+                self.missing[row_id] = 1
+            else:
+                self.missing[row_id] = self.missing.get(row_id, 0) + 1
+
+    def valuesRestored(self, variable, values, columns=None):
+        if columns is None:
+            columns = self.columns_by_variable[variable]
+        for value in values:
+            for row_id in self._affectedRows(columns, value):
+                if row_id in self.inconsistent:
+                    continue
+                row = self.constraint._rows[row_id]
+                if row_id in self.active or not any(
+                    row[column] == value for column in columns
+                ):
+                    continue
+                missing = self.missing.get(row_id, 0) - 1
+                if missing > 0:
+                    self.missing[row_id] = missing
+                else:
+                    self.missing.pop(row_id, None)
+                    self._activate(row_id)
 
 
 class InSetConstraint(Constraint):

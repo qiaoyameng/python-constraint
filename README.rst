@@ -112,6 +112,7 @@ Predefined constraint types currently available:
 - :python:`ExactSumConstraint`
 - :python:`MaxSumConstraint`
 - :python:`MinSumConstraint`
+- :python:`TableConstraint`
 - :python:`InSetConstraint`
 - :python:`NotInSetConstraint`
 - :python:`SomeInSetConstraint`
