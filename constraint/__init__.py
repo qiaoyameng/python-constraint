@@ -270,7 +270,7 @@ class Problem(object):
             return []
         return self._solver.getSolutions(domains, constraints, vconstraints)
 
-    def getSolutionIter(self):
+    def getSolutionIter(self, visible_variables=None):
         """
         Return an iterator to the solutions of the problem
 
@@ -287,14 +287,58 @@ class Problem(object):
         Traceback (most recent call last):
           File "<stdin>", line 1, in ?
         StopIteration
+
+        @param visible_variables: Variables to include in each projected
+                                  solution. When omitted, all variables are
+                                  returned.
+        @type visible_variables: sequence of variable names or C{None}
         """
+        if visible_variables is not None:
+            return self.getProjectedSolutionIter(visible_variables)
         domains, constraints, vconstraints = self._getArgs()
         if not domains:
             return iter(())
         return self._solver.getSolutionIter(domains, constraints, vconstraints)
 
-    def _getArgs(self):
+    def getProjectedSolutionIter(self, visible_variables):
+        """
+        Return distinct assignments to the selected visible variables.
+
+        Hidden variables are used only to prove that each projected
+        assignment is satisfiable. Projection blocking is local to the
+        returned iterator and never changes this problem.
+        """
+        visible_variables = list(visible_variables)
+        duplicate_variables = set()
+        for variable in visible_variables:
+            if variable in duplicate_variables:
+                msg = "Duplicated visible variable %s" % repr(variable)
+                raise ValueError(msg)
+            duplicate_variables.add(variable)
+
+        unknown_variables = [
+            variable
+            for variable in visible_variables
+            if variable not in self._variables
+        ]
+        if unknown_variables:
+            msg = "Unknown variables %s" % repr(unknown_variables)
+            raise ValueError(msg)
+
+        domains, constraints, vconstraints = self._getArgs(copy_domains=True)
+        if not domains:
+            return iter(())
+        return self._solver.getProjectedSolutionIter(
+            domains, constraints, vconstraints, visible_variables
+        )
+
+    def _getArgs(self, copy_domains=False):
         domains = self._variables.copy()
+        if copy_domains:
+            domains = dict(
+                (variable, Domain(domain[:] + domain._hidden))
+                for variable, domain in domains.items()
+            )
         allvariables = domains.keys()
         constraints = []
         for constraint, variables in self._constraints:
@@ -437,6 +481,17 @@ class Solver(object):
         msg = "%s doesn't provide iteration" % self.__class__.__name__
         raise NotImplementedError(msg)
 
+    def getProjectedSolutionIter(
+        self, domains, constraints, vconstraints, visible_variables
+    ):
+        """
+        Return an iterator for distinct visible-variable assignments.
+        """
+        msg = "%s doesn't provide projected iteration" % (
+            self.__class__.__name__
+        )
+        raise NotImplementedError(msg)
+
 
 class BacktrackingSolver(Solver):
     """
@@ -477,6 +532,142 @@ class BacktrackingSolver(Solver):
         @type  forwardcheck: bool
         """
         self._forwardcheck = forwardcheck
+
+    def getProjectedSolutionIter(
+        self, domains, constraints, vconstraints, visible_variables
+    ):
+        forwardcheck = self._forwardcheck
+        visible_variables = list(visible_variables)
+
+        if not visible_variables:
+            if (
+                self.getSolution(domains, constraints, vconstraints)
+                is not None
+            ):
+                yield {}
+            return
+
+        visible_set = set(visible_variables)
+        assignments = {}
+        queue = []
+        blocks = []
+
+        def block(*values):
+            projection = tuple(values)
+            for blocked in blocks:
+                if projection == blocked:
+                    return False
+            return True
+
+        block_constraint = FunctionConstraint(block)
+        block_item = (block_constraint, visible_variables)
+        constraints.append(block_item)
+        for variable in visible_variables:
+            vconstraints[variable].append(block_item)
+
+        while True:
+
+            # Select visible variables first so hidden values are only used
+            # to witness an already completed projection.
+            lst = [
+                (
+                    -len(vconstraints[variable]),
+                    len(domains[variable]),
+                    variable,
+                )
+                for variable in domains
+            ]
+            lst.sort()
+            unassigned = [
+                item for item in lst if item[-1] not in assignments
+            ]
+            for item in unassigned:
+                if item[-1] in visible_set:
+                    selected = item
+                    break
+            else:
+                if unassigned:
+                    selected = unassigned[0]
+                else:
+                    selected = None
+
+            if selected is None:
+                projection = tuple(
+                    (variable, assignments[variable])
+                    for variable in visible_variables
+                )
+                blocks.append(tuple(value for variable, value in projection))
+                yield dict(projection)
+
+                while len(queue) > len(visible_variables):
+                    variable, values, pushdomains = queue.pop()
+                    del assignments[variable]
+                    if pushdomains:
+                        for domain in pushdomains:
+                            domain.popState()
+
+                variable, values, pushdomains = queue.pop()
+                if pushdomains:
+                    for domain in pushdomains:
+                        domain.popState()
+            else:
+                variable = selected[-1]
+                values = domains[variable][:]
+                if forwardcheck:
+                    pushdomains = [
+                        domains[x]
+                        for x in domains
+                        if x not in assignments and x != variable
+                    ]
+                else:
+                    pushdomains = None
+
+                if not values:
+                    del assignments[variable]
+                    while queue:
+                        variable, values, pushdomains = queue.pop()
+                        if pushdomains:
+                            for domain in pushdomains:
+                                domain.popState()
+                        if values:
+                            break
+                        del assignments[variable]
+                    else:
+                        return
+
+            while True:
+                if not values:
+                    del assignments[variable]
+                    while queue:
+                        variable, values, pushdomains = queue.pop()
+                        if pushdomains:
+                            for domain in pushdomains:
+                                domain.popState()
+                        if values:
+                            break
+                        del assignments[variable]
+                    else:
+                        return
+
+                assignments[variable] = values.pop()
+
+                if pushdomains:
+                    for domain in pushdomains:
+                        domain.pushState()
+
+                for constraint, variables in vconstraints[variable]:
+                    if not constraint(
+                        variables, domains, assignments, pushdomains
+                    ):
+                        break
+                else:
+                    break
+
+                if pushdomains:
+                    for domain in pushdomains:
+                        domain.popState()
+
+            queue.append((variable, values, pushdomains))
 
     def getSolutionIter(self, domains, constraints, vconstraints):
         forwardcheck = self._forwardcheck
