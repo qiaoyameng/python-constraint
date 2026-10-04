@@ -30,7 +30,10 @@
 @group Solvers: Solver,
                 BacktrackingSolver,
                 RecursiveBacktrackingSolver,
-                MinConflictsSolver
+                MinConflictsSolver,
+                LexicographicBacktrackingSolver
+@group Optimization: LinearExpression,
+                     LexicographicResult
 @group Constraints: Constraint,
                     FunctionConstraint,
                     AllDifferentConstraint,
@@ -69,6 +72,9 @@ __all__ = [
     "BacktrackingSolver",
     "RecursiveBacktrackingSolver",
     "MinConflictsSolver",
+    "LexicographicBacktrackingSolver",
+    "LinearExpression",
+    "LexicographicResult",
     "Constraint",
     "FunctionConstraint",
     "AllDifferentConstraint",
@@ -315,6 +321,106 @@ class Problem(object):
                 return None, None, None
         # doArc8(getArcs(domains, constraints), domains, {})
         return domains, constraints, vconstraints
+
+    def getSolutionLexicographic(
+        self,
+        objectives,
+        mode="one",
+        pruning=True,
+        node_budget=None,
+    ):
+        """
+        Find a solution minimizing the given objectives in lexicographic order
+
+        The first objective is the primary one to be minimized; among the
+        solutions reaching its minimum, the second objective is minimized, and
+        so on.  The search performs branch-and-bound: at every node a lower
+        bound of each objective is computed from the current domains (including
+        values hidden by forward checking), and branches that cannot improve on
+        the incumbent are pruned.  Solutions are *not* collected and sorted.
+
+        Example:
+
+        >>> problem = Problem()
+        >>> problem.addVariables(["a", "b"], [0, 1, 2])
+        >>> result = problem.getSolutionLexicographic([
+        ...     LinearExpression({"a": 1, "b": 1}),
+        ...     LinearExpression({"a": -1}, constant=1),
+        ... ])
+        >>> result.status == LexicographicResult.OPTIMAL
+        True
+        >>> result.solution
+        {'a': 0, 'b': 0}
+
+        @param objectives: Non-empty sequence of integer linear expressions
+                           minimizing lexicographically.  Each item may be a
+                           L{LinearExpression}, a mapping of variables to
+                           integer coefficients, or a pair
+                           C{(coefficients, constant)}.
+        @type  objectives: sequence
+        @param mode: C{"one"} returns a single best solution, C{"all"} returns
+                     every best solution (default is C{"one"})
+        @type  mode: str
+        @param pruning: If false, lower-bound pruning is disabled and the
+                        whole search space is explored while still tracking
+                        the incumbent (default is true)
+        @type  pruning: bool
+        @param node_budget: Maximum number of search nodes to visit, if given.
+                            When exhausted, the result is reported as
+                            L{LexicographicResult.EXHAUSTED} with the best
+                            solution found so far, which is not proven optimal.
+        @type  node_budget: int or None
+        @return: Object holding the status (optimal, infeasible or exhausted),
+                 the best solution(s) found and the objective tuple values.
+        @rtype: L{LexicographicResult}
+        """
+        if mode not in ("one", "all"):
+            raise ValueError("mode must be 'one' or 'all'")
+        if node_budget is not None:
+            node_budget = int(node_budget)
+            if node_budget < 1:
+                raise ValueError("node_budget must be at least 1")
+
+        expressions = []
+        for objective in objectives:
+            expressions.append(LinearExpression._coerce(objective))
+        if not expressions:
+            raise ValueError("At least one objective is required")
+        for expression in expressions:
+            for variable in expression.coefficients:
+                if variable not in self._variables:
+                    msg = "Objective references unknown variable %s" % repr(
+                        variable
+                    )
+                    raise ValueError(msg)
+
+        domains, constraints, vconstraints = self._getArgs()
+        if not domains:
+            return LexicographicResult(
+                LexicographicResult.INFEASIBLE,
+                mode,
+                None,
+                [],
+                None,
+                0,
+                node_budget,
+                expressions,
+                getattr(self._solver, "_forwardcheck", True),
+                pruning,
+            )
+
+        solver = LexicographicBacktrackingSolver(
+            forwardcheck=getattr(self._solver, "_forwardcheck", True)
+        )
+        return solver.solve(
+            domains,
+            constraints,
+            vconstraints,
+            expressions,
+            mode,
+            pruning,
+            node_budget,
+        )
 
 
 # ----------------------------------------------------------------------
@@ -740,6 +846,161 @@ class MinConflictsSolver(Solver):
         return None
 
 
+class LexicographicBacktrackingSolver(Solver):
+    """
+    Branch-and-bound solver minimizing integer linear expressions in
+    lexicographic order
+    """
+
+    def __init__(self, forwardcheck=True):
+        """
+        @param forwardcheck: If false forward checking will not be requested
+                             to constraints while looking for solutions
+                             (default is true)
+        @type  forwardcheck: bool
+        """
+        self._forwardcheck = forwardcheck
+
+    def solve(
+        self,
+        domains,
+        constraints,
+        vconstraints,
+        objectives,
+        mode,
+        pruning,
+        node_budget,
+    ):
+        state = {
+            "best": None,
+            "solutions": [],
+            "nodes": 0,
+            "exhausted": False,
+        }
+        self._search(
+            domains,
+            vconstraints,
+            {},
+            objectives,
+            mode,
+            pruning,
+            node_budget,
+            state,
+        )
+        if state["exhausted"]:
+            status = LexicographicResult.EXHAUSTED
+        elif state["best"] is None:
+            status = LexicographicResult.INFEASIBLE
+        else:
+            status = LexicographicResult.OPTIMAL
+        return LexicographicResult(
+            status,
+            mode,
+            state["best"],
+            state["solutions"],
+            state["best"],
+            state["nodes"],
+            node_budget,
+            objectives,
+            self._forwardcheck,
+            pruning,
+        )
+
+    def _search(
+        self,
+        domains,
+        vconstraints,
+        assignments,
+        objectives,
+        mode,
+        pruning,
+        node_budget,
+        state,
+    ):
+        if node_budget is not None and state["nodes"] >= node_budget:
+            state["exhausted"] = True
+            return
+        state["nodes"] += 1
+
+        best = state["best"]
+        if pruning and best is not None:
+            bound = tuple(
+                expression.lowerBound(domains, assignments)
+                for expression in objectives
+            )
+            if mode == "all":
+                # Equal-bound branches may still contain tied optima.
+                if bound > best:
+                    return
+            elif bound >= best:
+                # A single best solution is already kept; ties are irrelevant.
+                return
+
+        # Mix the Degree and Minimum Remaing Values (MRV) heuristics
+        lst = [
+            (-len(vconstraints[variable]), len(domains[variable]), variable)
+            for variable in domains
+        ]
+        lst.sort()
+        for item in lst:
+            if item[-1] not in assignments:
+                variable = item[-1]
+                break
+        else:
+            # No unassigned variables. We've got a complete solution.
+            values = tuple(
+                expression.evaluate(assignments) for expression in objectives
+            )
+            self._accept(values, assignments, mode, state)
+            return
+
+        assignments[variable] = None
+
+        if self._forwardcheck:
+            pushdomains = [
+                domains[x] for x in domains if x not in assignments
+            ]
+        else:
+            pushdomains = None
+
+        for value in domains[variable]:
+            if state["exhausted"]:
+                break
+            assignments[variable] = value
+            if pushdomains:
+                for domain in pushdomains:
+                    domain.pushState()
+            for constraint, variables in vconstraints[variable]:
+                if not constraint(variables, domains, assignments, pushdomains):
+                    # Value is not good.
+                    break
+            else:
+                # Value is good. Recurse and get next variable.
+                self._search(
+                    domains,
+                    vconstraints,
+                    assignments,
+                    objectives,
+                    mode,
+                    pruning,
+                    node_budget,
+                    state,
+                )
+            if pushdomains:
+                for domain in pushdomains:
+                    domain.popState()
+        del assignments[variable]
+
+    def _accept(self, values, assignments, mode, state):
+        best = state["best"]
+        if best is None or values < best:
+            state["best"] = values
+            del state["solutions"][:]
+            state["solutions"].append(assignments.copy())
+        elif values == best and mode == "all":
+            state["solutions"].append(assignments.copy())
+
+
 # ----------------------------------------------------------------------
 # Variables
 # ----------------------------------------------------------------------
@@ -829,6 +1090,311 @@ class Domain(list):
         """
         list.remove(self, value)
         self._hidden.append(value)
+
+
+# ----------------------------------------------------------------------
+# Optimization
+# ----------------------------------------------------------------------
+
+
+class LinearExpression(object):
+    """
+    Integer linear expression used as a lexicographic objective
+
+    The expression has the form::
+
+        constant + sum(coefficient[var] * value(var))
+
+    Coefficients and the constant must be integers; coefficients may be
+    negative or zero (zero coefficients are discarded).
+
+    Example:
+
+    >>> expr = LinearExpression({"a": 2, "b": -1}, constant=5)
+    >>> expr.evaluate({"a": 3, "b": 4})
+    7
+    >>> expr.evaluate({"a": 3})
+    11
+    """
+
+    def __init__(self, coefficients=None, constant=0):
+        """
+        @param coefficients: Mapping of variables to integer coefficients,
+                             or a sequence of C{(variable, coefficient)}
+                             pairs (default is an empty mapping)
+        @type  coefficients: dict or sequence of pairs
+        @param constant: Integer constant term of the expression
+                         (default is 0)
+        @type  constant: int
+        """
+        if coefficients is None:
+            coefficients = {}
+        if isinstance(coefficients, LinearExpression):
+            coefficients = coefficients.coefficients.copy()
+        self._coefficients = {}
+        items = (
+            coefficients.items()
+            if hasattr(coefficients, "items")
+            else coefficients
+        )
+        for variable, coefficient in items:
+            if not isinstance(coefficient, int):
+                msg = "Coefficients must be integers, got %r" % (coefficient,)
+                raise ValueError(msg)
+            if coefficient:
+                self._coefficients[variable] = coefficient
+        if not isinstance(constant, int):
+            msg = "The constant term must be an integer, got %r" % (constant,)
+            raise ValueError(msg)
+        self._constant = constant
+
+    @property
+    def coefficients(self):
+        """
+        Mapping of variables to their non-zero integer coefficients
+        """
+        return self._coefficients
+
+    @property
+    def constant(self):
+        """
+        Integer constant term of the expression
+        """
+        return self._constant
+
+    def variables(self):
+        """
+        Return the variables appearing with a non-zero coefficient
+
+        @rtype: tuple
+        """
+        return tuple(self._coefficients)
+
+    def evaluate(self, assignments):
+        """
+        Evaluate the expression on the given (possibly partial) assignment
+
+        Unassigned variables contribute zero.  For a complete assignment this
+        is the exact value; for a partial one it is the assigned part only.
+
+        @param assignments: Mapping of variables to integer values
+        @type  assignments: dict
+        @return: Integer value of the expression
+        @rtype: int
+        """
+        value = self._constant
+        for variable, coefficient in self._coefficients.items():
+            if variable in assignments and assignments[variable] is not None:
+                value += coefficient * assignments[variable]
+        return value
+
+    def lowerBound(self, domains, assignments):
+        """
+        Return a lower bound of the expression from the current domains
+
+        Assigned variables use their current value; each unassigned variable
+        contributes C{coefficient * min(domain)} when the coefficient is
+        positive and C{coefficient * max(domain)} when it is negative.  The
+        bound is exact on a complete assignment.
+
+        @param domains: Dictionary mapping variables to their current domains
+        @type  domains: dict
+        @param assignments: Dictionary mapping assigned variables to values
+        @type  assignments: dict
+        @return: Integer lower bound of the expression
+        @rtype: int
+        """
+        bound = self._constant
+        for variable, coefficient in self._coefficients.items():
+            if variable in assignments and assignments[variable] is not None:
+                bound += coefficient * assignments[variable]
+            else:
+                domain = domains[variable]
+                if coefficient > 0:
+                    bound += coefficient * min(domain)
+                else:
+                    bound += coefficient * max(domain)
+        return bound
+
+    @staticmethod
+    def _coerce(objective):
+        if isinstance(objective, LinearExpression):
+            return objective
+        constant = 0
+        if (
+            isinstance(objective, tuple)
+            and len(objective) == 2
+            and not hasattr(objective, "items")
+        ):
+            coefficients, constant = objective
+        else:
+            coefficients = objective
+        try:
+            return LinearExpression(coefficients, constant)
+        except (TypeError, AttributeError):
+            msg = "Objectives must be LinearExpression instances or coefficient mappings"
+            raise ValueError(msg)
+
+    def __repr__(self):
+        return "LinearExpression(%r, constant=%r)" % (
+            self._coefficients,
+            self._constant,
+        )
+
+
+class LexicographicResult(object):
+    """
+    Result of a lexicographic optimization
+
+    Three situations are distinguished by L{status}:
+
+      - L{OPTIMAL}: at least one solution exists and the returned one(s)
+        are proven optimal within the search limits,
+      - L{INFEASIBLE}: the problem has no solution,
+      - L{EXHAUSTED}: the caller supplied a node budget that ran out; the
+        returned solution, if any, is the best found so far but is *not*
+        proven optimal.
+
+    Example:
+
+    >>> result = LexicographicResult(
+    ...     LexicographicResult.OPTIMAL, "one", (1, 0),
+    ...     [{"a": 1}], (1, 0), 3, None, [], True, True)
+    >>> result.status == LexicographicResult.OPTIMAL
+    True
+    >>> result.solution
+    {'a': 1}
+    >>> result.objective_values
+    (1, 0)
+    """
+
+    OPTIMAL = "optimal"
+    INFEASIBLE = "infeasible"
+    EXHAUSTED = "exhausted"
+
+    def __init__(
+        self,
+        status,
+        mode,
+        best,
+        solutions,
+        objective_values,
+        nodes,
+        node_budget,
+        objectives,
+        forwardcheck,
+        pruning,
+    ):
+        self._status = status
+        self._mode = mode
+        self._best = best
+        self._solutions = solutions
+        self._objective_values = objective_values
+        self._nodes = nodes
+        self._node_budget = node_budget
+        self._objectives = tuple(objectives)
+        self._forwardcheck = forwardcheck
+        self._pruning = pruning
+
+    @property
+    def status(self):
+        """
+        One of L{OPTIMAL}, L{INFEASIBLE} or L{EXHAUSTED}
+        """
+        return self._status
+
+    @property
+    def mode(self):
+        """
+        Mode used for the search (C{"one"} or C{"all"})
+        """
+        return self._mode
+
+    @property
+    def proven_optimal(self):
+        """
+        True only when the status is L{OPTIMAL}
+        """
+        return self._status == self.OPTIMAL
+
+    @property
+    def solution(self):
+        """
+        Best solution found, or C{None} when none was found
+        """
+        if self._status == self.INFEASIBLE:
+            return None
+        return self._solutions[0] if self._solutions else None
+
+    @property
+    def solutions(self):
+        """
+        Tuple of best solutions found (empty when infeasible)
+
+        In C{"one"} mode it contains at most one solution; in C{"all"} mode
+        it contains every solution sharing the best objective tuple.
+        """
+        return tuple(self._solutions)
+
+    @property
+    def objective_values(self):
+        """
+        Tuple of objective values of the best solution, or C{None}
+        """
+        return self._objective_values
+
+    @property
+    def best_value(self):
+        """
+        Alias of L{objective_values}
+        """
+        return self._objective_values
+
+    @property
+    def nodes_visited(self):
+        """
+        Number of search nodes visited
+        """
+        return self._nodes
+
+    @property
+    def node_budget(self):
+        """
+        Node budget supplied by the caller, or C{None}
+        """
+        return self._node_budget
+
+    @property
+    def budget_exhausted(self):
+        """
+        True when the node budget ran out before optimality was proven
+        """
+        return self._status == self.EXHAUSTED
+
+    @property
+    def objectives(self):
+        """
+        Tuple of L{LinearExpression} objectives used for the search
+        """
+        return self._objectives
+
+    def __bool__(self):
+        return self._status != self.INFEASIBLE
+
+    __nonzero__ = __bool__
+
+    def __repr__(self):
+        return (
+            "LexicographicResult(status=%r, solution=%r, objective_values=%r, "
+            "nodes=%r, node_budget=%r)"
+            % (
+                self._status,
+                self.solution,
+                self._objective_values,
+                self._nodes,
+                self._node_budget,
+            )
+        )
 
 
 # ----------------------------------------------------------------------
