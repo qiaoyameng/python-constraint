@@ -65,6 +65,7 @@ __all__ = [
     "Variable",
     "Domain",
     "Unassigned",
+    "MusResult",
     "Solver",
     "BacktrackingSolver",
     "RecursiveBacktrackingSolver",
@@ -96,6 +97,7 @@ class Problem(object):
         """
         self._solver = solver or BacktrackingSolver()
         self._constraints = []
+        self._constraint_labels = []
         self._variables = {}
 
     def reset(self):
@@ -111,6 +113,7 @@ class Problem(object):
         >>>
         """
         del self._constraints[:]
+        del self._constraint_labels[:]
         self._variables.clear()
 
     def setSolver(self, solver):
@@ -200,7 +203,7 @@ class Problem(object):
         for variable in variables:
             self.addVariable(variable, domain)
 
-    def addConstraint(self, constraint, variables=None):
+    def addConstraint(self, constraint, variables=None, label=None):
         """
         Add a constraint to the problem
 
@@ -212,6 +215,18 @@ class Problem(object):
         >>> solutions = problem.getSolutions()
         >>>
 
+        Constraints may carry a stable label so that they can be
+        referenced later, e.g. by L{findMinimalUnsatisfiableSubset}:
+
+        >>> problem = Problem()
+        >>> problem.addVariables(["a"], [1, 2])
+        >>> problem.addConstraint(lambda a: a == 1, ["a"], label="a-is-1")
+        >>> problem.addConstraint(lambda a: a == 2, ["a"], label="a-is-2")
+        >>> problem.addConstraint(lambda a: a == 1, ["a"], label="a-is-1")
+        Traceback (most recent call last):
+        ...
+        ValueError: Duplicated constraint label 'a-is-1'
+
         @param constraint: Constraint to be included in the problem
         @type  constraint: instance a L{Constraint} subclass or a
                            function to be wrapped by L{FunctionConstraint}
@@ -219,6 +234,11 @@ class Problem(object):
                           all variables). Depending on the constraint type
                           the order may be important.
         @type  variables: set or sequence of variables
+        @param label: Optional stable label identifying this constraint.
+                      Labels must be unique within a problem. Unlabeled
+                      constraints always apply and never take part in
+                      conflict filtering.
+        @type  label: hashable object
         """
         if not isinstance(constraint, Constraint):
             if callable(constraint):
@@ -226,7 +246,11 @@ class Problem(object):
             else:
                 msg = "Constraints must be instances of subclasses " "of the Constraint class"
                 raise ValueError(msg)
+        if label is not None and label in self._constraint_labels:
+            msg = "Duplicated constraint label %r" % (label,)
+            raise ValueError(msg)
         self._constraints.append((constraint, variables))
+        self._constraint_labels.append(label)
 
     def getSolution(self):
         """
@@ -293,11 +317,18 @@ class Problem(object):
             return iter(())
         return self._solver.getSolutionIter(domains, constraints, vconstraints)
 
-    def _getArgs(self):
-        domains = self._variables.copy()
+    def _getArgs(self, entries=None):
+        # Each call builds fresh Domain copies so that value removals
+        # performed by constraint preprocessing never leak into the
+        # problem definition or into subsequent solver calls.
+        domains = {}
+        for variable, domain in self._variables.items():
+            domains[variable] = Domain(domain)
         allvariables = domains.keys()
         constraints = []
-        for constraint, variables in self._constraints:
+        if entries is None:
+            entries = self._constraints
+        for constraint, variables in entries:
             if not variables:
                 variables = list(allvariables)
             constraints.append((constraint, variables))
@@ -315,6 +346,187 @@ class Problem(object):
                 return None, None, None
         # doArc8(getArcs(domains, constraints), domains, {})
         return domains, constraints, vconstraints
+
+    def _solveSubset(self, entries):
+        domains, constraints, vconstraints = self._getArgs(entries)
+        if not domains:
+            return None
+        return self._solver.getSolution(domains, constraints, vconstraints)
+
+    def findMinimalUnsatisfiableSubset(self, background=(), candidates=None,
+                                       budget=None):
+        """
+        Find a minimal unsatisfiable subset of the labeled constraints
+
+        Background constraints always apply. Only candidate constraints
+        take part in the filtering. Unlabeled constraints are implicitly
+        part of the background.
+
+        Example:
+
+        >>> problem = Problem()
+        >>> problem.addVariables(["a", "b"], [1, 2, 3])
+        >>> problem.addConstraint(lambda a: a == 1, ["a"], label="a-is-1")
+        >>> problem.addConstraint(lambda a: a == 2, ["a"], label="a-is-2")
+        >>> problem.addConstraint(lambda a, b: a != b, ["a", "b"],
+        ...                       label="a-neq-b")
+        >>> result = problem.findMinimalUnsatisfiableSubset()
+        >>> result.status == MusResult.UNSATISFIABLE
+        True
+        >>> sorted(result.conflict)
+        ['a-is-1', 'a-is-2']
+
+        The returned conflict is minimal: removing any of its members
+        makes the remaining constraints (plus the background) satisfiable.
+        When several disjoint conflicts exist, any one of them may be
+        returned.
+
+        Every satisfiability check is run with an independent domain
+        state, so domain pruning performed while checking one subset
+        never affects the next check or the problem itself.
+
+        @param background: Labels of constraints that always apply
+        @type  background: iterable of labels
+        @param candidates: Labels of constraints taking part in the
+                           filtering (default is every labeled constraint
+                           not in the background)
+        @type  candidates: iterable of labels
+        @param budget: Maximum number of solver checks to perform
+                       (default is no limit). When the budget is
+                       exhausted an incomplete result is returned,
+                       carrying the evidence gathered so far without
+                       any minimality guarantee.
+        @type  budget: int
+        @return: Result describing the outcome of the search
+        @rtype: L{MusResult}
+        """
+        background = set(background)
+        bg_entries = []
+        available = []
+        for entry, label in zip(self._constraints, self._constraint_labels):
+            if label is None or label in background:
+                bg_entries.append(entry)
+            else:
+                available.append((label, entry))
+        if candidates is None:
+            selected = available
+        else:
+            by_label = dict(available)
+            selected = []
+            for label in candidates:
+                if label in background:
+                    continue
+                if label not in by_label:
+                    msg = "Unknown constraint label %r" % (label,)
+                    raise ValueError(msg)
+                selected.append((label, by_label[label]))
+
+        checks = [0]
+        exhausted = object()
+
+        def attempt(entries):
+            if budget is not None and checks[0] >= budget:
+                return exhausted
+            checks[0] += 1
+            return self._solveSubset(entries)
+
+        def working_labels(working):
+            return [label for label, _ in working]
+
+        def working_entries(working):
+            return bg_entries + [entry for _, entry in working]
+
+        solution = attempt(bg_entries)
+        if solution is exhausted:
+            return MusResult(MusResult.INCOMPLETE, checks=checks[0])
+        if solution is None:
+            return MusResult(MusResult.BACKGROUND_UNSATISFIABLE,
+                             conflict=[], checks=checks[0])
+
+        working = list(selected)
+        solution = attempt(working_entries(working))
+        if solution is exhausted:
+            return MusResult(MusResult.INCOMPLETE, checks=checks[0])
+        if solution is not None:
+            return MusResult(MusResult.SATISFIABLE, solution=solution,
+                             checks=checks[0])
+
+        # Deletion-based minimization. The background plus the current
+        # working set is kept unsatisfiable throughout the loop.
+        for label, entry in list(working):
+            rest = [item for item in working if item[0] != label]
+            if not rest:
+                # The background alone is known to be satisfiable.
+                continue
+            solution = attempt(working_entries(rest))
+            if solution is exhausted:
+                return MusResult(MusResult.INCOMPLETE,
+                                 conflict=working_labels(working),
+                                 checks=checks[0])
+            if solution is None:
+                working = rest
+
+        return MusResult(MusResult.UNSATISFIABLE,
+                         conflict=working_labels(working),
+                         checks=checks[0])
+
+
+# ----------------------------------------------------------------------
+# Conflict analysis
+# ----------------------------------------------------------------------
+
+
+class MusResult(object):
+    """
+    Outcome of L{Problem.findMinimalUnsatisfiableSubset}
+
+    The C{status} attribute is one of:
+
+    - C{MusResult.SATISFIABLE}: the background plus all candidate
+      constraints is satisfiable. C{solution} holds a solution and
+      C{conflict} is None.
+    - C{MusResult.BACKGROUND_UNSATISFIABLE}: the background alone is
+      already unsatisfiable. C{conflict} is the empty list.
+    - C{MusResult.UNSATISFIABLE}: C{conflict} holds the labels of a
+      minimal unsatisfiable subset of the candidates. Removing any
+      single member makes the remaining constraints, together with
+      the background, satisfiable.
+    - C{MusResult.INCOMPLETE}: the check budget was exhausted.
+      C{conflict} holds the labels of a subset still known to be
+      unsatisfiable together with the background (or None if no such
+      evidence was established), without any minimality guarantee.
+
+    @ivar status: One of the status constants defined above
+    @ivar conflict: List of constraint labels, or None
+    @ivar solution: A solution when the status is C{SATISFIABLE}
+    @ivar checks: Number of solver checks performed
+    """
+
+    SATISFIABLE = "satisfiable"
+    UNSATISFIABLE = "unsatisfiable"
+    BACKGROUND_UNSATISFIABLE = "background_unsatisfiable"
+    INCOMPLETE = "incomplete"
+
+    def __init__(self, status, conflict=None, solution=None, checks=0):
+        self.status = status
+        self.conflict = conflict
+        self.solution = solution
+        self.checks = checks
+
+    @property
+    def complete(self):
+        """
+        Whether the search ran to completion within its budget
+        """
+        return self.status != self.INCOMPLETE
+
+    def __repr__(self):
+        return "%s(status=%r, conflict=%r, checks=%r)" % (
+            self.__class__.__name__,
+            self.status,
+            self.conflict,
+            self.checks,
+        )
 
 
 # ----------------------------------------------------------------------
