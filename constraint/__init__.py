@@ -41,7 +41,8 @@
                     InSetConstraint,
                     NotInSetConstraint,
                     SomeInSetConstraint,
-                    SomeNotInSetConstraint
+                    SomeNotInSetConstraint,
+                    GlobalCardinalityConstraint
 """
 
 from __future__ import absolute_import, division, print_function
@@ -80,6 +81,7 @@ __all__ = [
     "NotInSetConstraint",
     "SomeInSetConstraint",
     "SomeNotInSetConstraint",
+    "GlobalCardinalityConstraint",
 ]
 
 
@@ -831,6 +833,55 @@ class Domain(list):
         self._hidden.append(value)
 
 
+def _maxflow(capacity, source, sink):
+    """
+    Compute the maximum flow between two nodes of a network
+
+    Helper for constraint propagation. The network is described by a
+    square matrix of integer capacities, which is destructively updated
+    to the final residual capacities.
+
+    @param capacity: Square matrix of non-negative integer capacities
+    @type  capacity: list of lists of ints
+    @param source: Index of the source node
+    @type  source: int
+    @param sink: Index of the sink node
+    @type  sink: int
+    @return: Maximum flow value
+    @rtype: int
+    """
+    size = len(capacity)
+    flow = 0
+    while True:
+        parent = [-1] * size
+        parent[source] = source
+        queue = [source]
+        head = 0
+        while head < len(queue) and parent[sink] == -1:
+            node = queue[head]
+            head += 1
+            row = capacity[node]
+            for other in range(size):
+                if parent[other] == -1 and row[other] > 0:
+                    parent[other] = node
+                    queue.append(other)
+        if parent[sink] == -1:
+            return flow
+        increment = None
+        node = sink
+        while node != source:
+            residual = capacity[parent[node]][node]
+            if increment is None or residual < increment:
+                increment = residual
+            node = parent[node]
+        node = sink
+        while node != source:
+            capacity[parent[node]][node] -= increment
+            capacity[node][parent[node]] += increment
+            node = parent[node]
+        flow += increment
+
+
 # ----------------------------------------------------------------------
 # Constraints
 # ----------------------------------------------------------------------
@@ -1492,6 +1543,193 @@ class SomeNotInSetConstraint(Constraint):
             else:
                 if found < self._n:
                     return False
+        return True
+
+
+class GlobalCardinalityConstraint(Constraint):
+    """
+    Constraint enforcing per-value lower and upper bounds on the number
+    of variables assigned to each value
+
+    Values not present in the given counts are allowed only when the
+    constraint is created with C{closed=False}, and are then unbounded.
+
+    Propagation reasons about all values jointly, since several values
+    may compete for the same variables: feasibility is checked with
+    max-flow computations over the bipartite graph linking values to
+    the variables that may still assume them, and values without
+    support are hidden from the domains of unassigned variables.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b", "c"], ["night", "day"])
+    >>> problem.addConstraint(GlobalCardinalityConstraint(
+    ...     {"night": (2, None), "day": (1, 1)}))
+    >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+    [[('a', 'day'), ('b', 'night'), ('c', 'night')], [('a', 'night'), ('b', 'day'), ('c', 'night')], [('a', 'night'), ('b', 'night'), ('c', 'day')]]
+    """
+
+    def __init__(self, counts, closed=True):
+        """
+        @param counts: Mapping of values to (minimum, maximum) pairs
+                       defining how many variables may be assigned to
+                       each value. A maximum of C{None} means unbounded.
+        @type  counts: dict
+        @param closed: Whether values absent from C{counts} are
+                       disallowed (default is true)
+        @type  closed: bool
+        """
+        if not hasattr(counts, "items"):
+            msg = "Counts must be a mapping of values to (min, max) pairs"
+            raise ValueError(msg)
+        self._counts = {}
+        for value, bounds in counts.items():
+            try:
+                low, high = bounds
+            except (TypeError, ValueError):
+                msg = "Bounds for value %r must be a (min, max) pair" % (value,)
+                raise ValueError(msg)
+            if not isinstance(low, int) or low < 0:
+                msg = "Minimum for value %r must be a non-negative integer" % (value,)
+                raise ValueError(msg)
+            if high is not None and (not isinstance(high, int) or high < low):
+                msg = (
+                    "Maximum for value %r must be None or an integer"
+                    " not smaller than the minimum" % (value,)
+                )
+                raise ValueError(msg)
+            self._counts[value] = (low, high)
+        self._closed = closed
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        if len(set(variables)) != len(variables):
+            msg = "GlobalCardinalityConstraint received duplicated variables"
+            raise ValueError(msg)
+        if self._closed:
+            counts = self._counts
+            for variable in variables:
+                domain = domains[variable]
+                for value in domain[:]:
+                    if value not in counts:
+                        domain.remove(value)
+
+    def __call__(
+        self,
+        variables,
+        domains,
+        assignments,
+        forwardcheck=False,
+        _unassigned=Unassigned,
+    ):
+        counts = self._counts
+        assigned = {}
+        unassigned = []
+        for variable in variables:
+            value = assignments.get(variable, _unassigned)
+            if value is _unassigned:
+                unassigned.append(variable)
+            else:
+                assigned[value] = assigned.get(value, 0) + 1
+        for value, count in assigned.items():
+            bounds = counts.get(value)
+            if bounds is None:
+                if self._closed:
+                    return False
+            elif bounds[1] is not None and count > bounds[1]:
+                return False
+        if not self._feasible(unassigned, domains, assigned):
+            return False
+        if forwardcheck:
+            changed = True
+            while changed:
+                changed = False
+                for variable in unassigned:
+                    domain = domains[variable]
+                    for value in domain[:]:
+                        if not self._hasSupport(
+                            variable, value, unassigned, domains, assigned
+                        ):
+                            domain.hideValue(value)
+                            changed = True
+                    if not domain:
+                        return False
+        return True
+
+    def _hasSupport(self, variable, value, unassigned, domains, assigned):
+        """
+        Tell whether tentatively assigning C{value} to C{variable} may
+        still be extended to an assignment satisfying all bounds
+        """
+        bounds = self._counts.get(value)
+        if bounds is None:
+            if self._closed:
+                return False
+        elif bounds[1] is not None and assigned.get(value, 0) + 1 > bounds[1]:
+            return False
+        extended = dict(assigned)
+        extended[value] = extended.get(value, 0) + 1
+        rest = [other for other in unassigned if other != variable]
+        return self._feasible(rest, domains, extended)
+
+    def _feasible(self, unassigned, domains, assigned):
+        """
+        Tell whether the unassigned variables may still be assigned so
+        that every value ends up within its lower and upper bounds
+
+        Both checks are max-flow computations over the bipartite graph
+        linking values to the variables that may still assume them, so
+        that values competing for the same variables are accounted for
+        jointly rather than independently.
+        """
+        counts = self._counts
+        demands = {}
+        for value, (low, high) in counts.items():
+            demand = low - assigned.get(value, 0)
+            if demand > 0:
+                demands[value] = demand
+        if demands:
+            total = sum(demands.values())
+            if total > len(unassigned):
+                return False
+            values = sorted(demands, key=repr)
+            sink = 1 + len(values) + len(unassigned)
+            capacity = [[0] * (sink + 1) for _ in range(sink + 1)]
+            for i, value in enumerate(values):
+                capacity[0][1 + i] = demands[value]
+            for j, variable in enumerate(unassigned):
+                domain = domains[variable]
+                for i, value in enumerate(values):
+                    if value in domain:
+                        capacity[1 + i][1 + len(values) + j] = 1
+                capacity[1 + len(values) + j][sink] = 1
+            if _maxflow(capacity, 0, sink) != total:
+                return False
+        if unassigned:
+            values = sorted(counts, key=repr)
+            sink = 1 + len(unassigned) + len(values)
+            capacity = [[0] * (sink + 1) for _ in range(sink + 1)]
+            for j, variable in enumerate(unassigned):
+                capacity[0][1 + j] = 1
+                domain = domains[variable]
+                free = False
+                for value in domain:
+                    if value in counts:
+                        capacity[1 + j][1 + len(unassigned) + values.index(value)] = 1
+                    else:
+                        free = True
+                if free and not self._closed:
+                    capacity[1 + j][sink] = 1
+            for i, value in enumerate(values):
+                low, high = counts[value]
+                if high is None:
+                    capacity[1 + len(unassigned) + i][sink] = len(unassigned)
+                else:
+                    capacity[1 + len(unassigned) + i][sink] = high - assigned.get(
+                        value, 0
+                    )
+            if _maxflow(capacity, 0, sink) != len(unassigned):
+                return False
         return True
 
 
