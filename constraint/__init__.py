@@ -34,6 +34,7 @@
 @group Constraints: Constraint,
                     FunctionConstraint,
                     AllDifferentConstraint,
+                    AllDifferentMatchingConstraint,
                     AllEqualConstraint,
                     MaxSumConstraint,
                     ExactSumConstraint,
@@ -72,6 +73,7 @@ __all__ = [
     "Constraint",
     "FunctionConstraint",
     "AllDifferentConstraint",
+    "AllDifferentMatchingConstraint",
     "AllEqualConstraint",
     "MaxSumConstraint",
     "ExactSumConstraint",
@@ -1031,6 +1033,250 @@ class AllDifferentConstraint(Constraint):
                             if not domain:
                                 return False
         return True
+
+
+def _matching_augment(variable, supports, matchedvariable, seen):
+    """
+    Find an augmenting path for the given variable (Kuhn's algorithm)
+
+    @param variable: Variable to be matched
+    @type  variable: object
+    @param supports: Dictionary mapping variables to their candidate values
+    @type  supports: dict
+    @param matchedvariable: Dictionary mapping matched values to variables,
+                            updated in place
+    @type  matchedvariable: dict
+    @param seen: Set of values already visited on this search
+    @type  seen: set
+    @return: Whether the variable could be matched
+    @rtype: bool
+    """
+    for value in supports[variable]:
+        if value not in seen:
+            seen.add(value)
+            if value not in matchedvariable or _matching_augment(
+                matchedvariable[value], supports, matchedvariable, seen
+            ):
+                matchedvariable[value] = variable
+                return True
+    return False
+
+
+def _maximum_matching(variables, supports):
+    """
+    Compute a maximum matching over the variable/value support graph
+
+    @param variables: Variables to be matched
+    @type  variables: sequence
+    @param supports: Dictionary mapping variables to their candidate values
+    @type  supports: dict
+    @return: Dictionary mapping values to variables, covering every
+             variable, or None if no complete matching exists
+    @rtype: dict or None
+    """
+    matchedvariable = {}
+    for variable in variables:
+        if not _matching_augment(variable, supports, matchedvariable, set()):
+            return None
+    return matchedvariable
+
+
+def _strongly_connected_components(nodes, arcs):
+    """
+    Tarjan's algorithm for strongly connected components
+
+    @param nodes: Nodes of the directed graph
+    @type  nodes: sequence
+    @param arcs: Dictionary mapping each node to its outgoing nodes
+    @type  arcs: dict
+    @return: Dictionary mapping each node to a component identifier
+    @rtype: dict
+    """
+    index_of = {}
+    lowlink = {}
+    onstack = {}
+    stack = []
+    component = {}
+    counter = [0]
+    ncomponents = [0]
+
+    def visit(node):
+        index_of[node] = lowlink[node] = counter[0]
+        counter[0] += 1
+        stack.append(node)
+        onstack[node] = True
+        for other in arcs.get(node, ()):
+            if other not in index_of:
+                visit(other)
+                lowlink[node] = min(lowlink[node], lowlink[other])
+            elif onstack.get(other):
+                lowlink[node] = min(lowlink[node], index_of[other])
+        if lowlink[node] == index_of[node]:
+            component_id = ncomponents[0]
+            ncomponents[0] += 1
+            while True:
+                other = stack.pop()
+                onstack[other] = False
+                component[other] = component_id
+                if other == node:
+                    break
+
+    for node in nodes:
+        if node not in index_of:
+            visit(node)
+    return component
+
+
+def _unsupported_values(variables, supports, matchedvariable):
+    """
+    Find candidate values which belong to no complete matching
+
+    A value survives when it is selected by the current matching, lies
+    on an alternating cycle (same strongly connected component as its
+    variable in the oriented graph), or is reachable from a free value
+    through an alternating path. Anything else belongs to no complete
+    matching and may be safely removed. Note that a value is never
+    removed merely because the current matching did not select it.
+
+    @param variables: Variables covered by the matching
+    @type  variables: sequence
+    @param supports: Dictionary mapping variables to their candidate values
+    @type  supports: dict
+    @param matchedvariable: Dictionary mapping matched values to variables
+    @type  matchedvariable: dict
+    @return: Dictionary mapping variables to their unsupported values
+    @rtype: dict
+    """
+    matchedvalue = dict((variable, value)
+                        for value, variable in matchedvariable.items())
+    arcs = {}
+    nodeset = {}
+    freevalues = []
+    for variable in variables:
+        variablenode = ("variable", variable)
+        nodeset[variablenode] = True
+        mvalue = matchedvalue[variable]
+        arcs.setdefault(variablenode, []).append(("value", mvalue))
+        for value in supports[variable]:
+            valuenode = ("value", value)
+            nodeset[valuenode] = True
+            if value == mvalue:
+                continue
+            # Unmatched edges are oriented from value to variable.
+            arcs.setdefault(valuenode, []).append(variablenode)
+            if value not in matchedvariable:
+                freevalues.append(valuenode)
+    # Values (and nodes further along alternating paths) reachable from
+    # free values take part in some complete matching.
+    reachable = dict.fromkeys(freevalues)
+    queue = list(freevalues)
+    while queue:
+        node = queue.pop()
+        for other in arcs.get(node, ()):
+            if other not in reachable:
+                reachable[other] = True
+                queue.append(other)
+    component = _strongly_connected_components(list(nodeset), arcs)
+    unsupported = {}
+    for variable in variables:
+        variablenode = ("variable", variable)
+        mvalue = matchedvalue[variable]
+        for value in supports[variable]:
+            if value == mvalue:
+                continue
+            valuenode = ("value", value)
+            if valuenode in reachable:
+                continue
+            if component.get(variablenode) == component.get(valuenode):
+                continue
+            unsupported.setdefault(variable, []).append(value)
+    return unsupported
+
+
+class AllDifferentMatchingConstraint(Constraint):
+    """
+    Constraint enforcing that values of all given variables are different,
+    propagating through bipartite matching
+
+    Besides the lightweight checks performed by L{AllDifferentConstraint},
+    this constraint builds the support graph relating variables to their
+    candidate values, computes a maximum matching over it, and removes
+    values which belong to no complete matching, so contradictions such
+    as Hall sets (more variables than feasible values in a subset) are
+    detected before the involved variables are assigned.
+
+    Matching state is recomputed from the current domains on every
+    invocation and no state is kept between calls, so domain changes are
+    naturally undone together with the search branch that caused them.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b"], [1, 2])
+    >>> problem.addVariable("c", [1, 2, 3])
+    >>> problem.addConstraint(AllDifferentMatchingConstraint())
+    >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+    [[('a', 1), ('b', 2), ('c', 3)], [('a', 2), ('b', 1), ('c', 3)]]
+    """
+
+    def __call__(
+        self,
+        variables,
+        domains,
+        assignments,
+        forwardcheck=False,
+        _unassigned=Unassigned,
+    ):
+        seen = {}
+        unassigned = []
+        for variable in variables:
+            value = assignments.get(variable, _unassigned)
+            if value is _unassigned:
+                unassigned.append(variable)
+            elif value in seen:
+                return False
+            else:
+                seen[value] = True
+        if not unassigned:
+            return True
+        supports = {}
+        for variable in unassigned:
+            values = [
+                value for value in domains[variable] if value not in seen
+            ]
+            if not values:
+                return False
+            supports[variable] = values
+        matchedvariable = _maximum_matching(unassigned, supports)
+        if matchedvariable is None:
+            return False
+        if forwardcheck:
+            unsupported = _unsupported_values(
+                unassigned, supports, matchedvariable
+            )
+            for variable, values in unsupported.items():
+                domain = domains[variable]
+                for value in values:
+                    if value in domain:
+                        domain.hideValue(value)
+                        if not domain:
+                            return False
+        return True
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        supports = dict(
+            (variable, list(domains[variable])) for variable in variables
+        )
+        matchedvariable = _maximum_matching(variables, supports)
+        if matchedvariable is None:
+            # No complete matching exists: the problem is unsatisfiable.
+            del domains[variables[0]][:]
+            return
+        unsupported = _unsupported_values(variables, supports, matchedvariable)
+        for variable, values in unsupported.items():
+            domain = domains[variable]
+            for value in values:
+                domain.remove(value)
 
 
 class AllEqualConstraint(Constraint):

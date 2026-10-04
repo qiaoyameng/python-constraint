@@ -5,6 +5,13 @@
 All notable changes to this code base will be documented in this file,
 in every released version.
 
+### Unreleased
+
+- Issues/Enhancements:
+  - Add `AllDifferentMatchingConstraint`, an AllDifferent constraint
+    propagating through bipartite matching (Hall set pruning), alongside
+    the existing lightweight `AllDifferentConstraint`
+
 ### Version 1.4.0
 
 - Released: 2018-11-05
