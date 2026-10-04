@@ -41,7 +41,8 @@
                     InSetConstraint,
                     NotInSetConstraint,
                     SomeInSetConstraint,
-                    SomeNotInSetConstraint
+                    SomeNotInSetConstraint,
+                    TableConstraint
 """
 
 from __future__ import absolute_import, division, print_function
@@ -58,6 +59,7 @@ from .version import __url__  # noqa
 
 import random
 import copy
+import weakref
 from .compat import xrange
 
 __all__ = [
@@ -80,6 +82,7 @@ __all__ = [
     "NotInSetConstraint",
     "SomeInSetConstraint",
     "SomeNotInSetConstraint",
+    "TableConstraint",
 ]
 
 
@@ -226,6 +229,17 @@ class Problem(object):
             else:
                 msg = "Constraints must be instances of subclasses " "of the Constraint class"
                 raise ValueError(msg)
+        if (
+            isinstance(constraint, TableConstraint)
+            and variables is not None
+            and constraint._arity is not None
+            and len(variables) != constraint._arity
+        ):
+            raise ValueError(
+                "Table row length does not match the number of variables"
+            )
+        if isinstance(constraint, TableConstraint) and variables is not None:
+            variables = list(variables)
         self._constraints.append((constraint, variables))
 
     def getSolution(self):
@@ -787,14 +801,24 @@ class Domain(list):
         list.__init__(self, set)
         self._hidden = []
         self._states = []
+        self._state_listeners = []
 
     def resetState(self):
         """
         Reset to the original domain state, including all possible values
         """
-        self.extend(self._hidden)
+        restored = self._hidden[:]
+        self.extend(restored)
         del self._hidden[:]
         del self._states[:]
+        for value in restored:
+            self._valueRestored(value)
+
+    def __copy__(self):
+        copied = self.__class__(list(self))
+        copied._hidden = self._hidden[:]
+        copied._states = self._states[:]
+        return copied
 
     def pushState(self):
         """
@@ -814,8 +838,32 @@ class Domain(list):
         """
         diff = self._states.pop() - len(self)
         if diff:
-            self.extend(self._hidden[-diff:])
+            restored = self._hidden[-diff:]
+            self.extend(restored)
             del self._hidden[-diff:]
+            for value in restored:
+                self._valueRestored(value)
+
+    def addStateListener(self, listener):
+        self._state_listeners.append(weakref.ref(listener))
+
+    def _valueHidden(self, value):
+        for listener_ref in self._state_listeners[:]:
+            listener = listener_ref()
+            if listener is not None:
+                listener.valueHidden(self, value)
+
+    def _valueRemoved(self, value):
+        for listener_ref in self._state_listeners[:]:
+            listener = listener_ref()
+            if listener is not None:
+                listener.valueRemoved(self, value)
+
+    def _valueRestored(self, value):
+        for listener_ref in self._state_listeners[:]:
+            listener = listener_ref()
+            if listener is not None:
+                listener.valueRestored(self, value)
 
     def hideValue(self, value):
         """
@@ -829,6 +877,11 @@ class Domain(list):
         """
         list.remove(self, value)
         self._hidden.append(value)
+        self._valueHidden(value)
+
+    def remove(self, value):
+        list.remove(self, value)
+        self._valueRemoved(value)
 
 
 # ----------------------------------------------------------------------
@@ -991,6 +1044,208 @@ class FunctionConstraint(Constraint):
                 self.forwardCheck(variables, domains, assignments)
             )
         return self._func(*parms)
+
+
+class TableConstraint(Constraint):
+    """
+    Constraint enforcing that variables assume one of the allowed tuples.
+    """
+
+    def __init__(self, rows):
+        """
+        @param rows: Allowed tuples, in the same order as constraint variables
+        @type rows: iterable of sequences
+        """
+        self._rows = []
+        self._rowset = set()
+        self._arity = None
+        for row in rows:
+            row = tuple(row)
+            if self._arity is None:
+                self._arity = len(row)
+            elif len(row) != self._arity:
+                raise ValueError("Table rows must all have the same length")
+            if row not in self._rowset:
+                self._rowset.add(row)
+                self._rows.append(row)
+        self._supports = []
+        for column in xrange(self._arity or 0):
+            values = {}
+            for row_id, row in enumerate(self._rows):
+                values.setdefault(row[column], set()).add(row_id)
+            self._supports.append(values)
+
+    def __call__(
+        self,
+        variables,
+        domains,
+        assignments,
+        forwardcheck=False,
+        _unassigned=Unassigned,
+    ):
+        parms = [assignments.get(x, _unassigned) for x in variables]
+        if _unassigned not in parms:
+            return tuple(parms) in self._rowset
+        return not forwardcheck or self.forwardCheck(
+            variables, domains, assignments
+        )
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        if self._arity is None:
+            for variable in variables:
+                domain = domains[variable]
+                for value in domain[:]:
+                    domain.remove(value)
+            constraints.remove((self, variables))
+            for variable in variables:
+                vconstraints[variable].remove((self, variables))
+            return
+
+        if len(variables) != self._arity:
+            raise ValueError(
+                "Table row length does not match the number of variables"
+            )
+
+        if self._arity == 0:
+            if not self._rows:
+                for domain in domains.values():
+                    for value in domain[:]:
+                        domain.remove(value)
+                constraints.remove((self, variables))
+            return
+
+        if self._arity == 1:
+            Constraint.preProcess(
+                self, variables, domains, constraints, vconstraints
+            )
+            return
+
+        compiled = _CompiledTableConstraint(self, variables, domains)
+        item = (self, variables)
+        compiled_item = (compiled, variables)
+        for index in xrange(len(constraints)):
+            current_constraint, current_variables = constraints[index]
+            if current_constraint is self and current_variables is variables:
+                constraints[index] = compiled_item
+                break
+        else:
+            constraints[constraints.index(item)] = compiled_item
+        for variable in variables:
+            linked = vconstraints[variable]
+            for index in xrange(len(linked)):
+                current_constraint, current_variables = linked[index]
+                if current_constraint is self and current_variables is variables:
+                    linked[index] = compiled_item
+                    break
+            else:
+                linked[linked.index(item)] = compiled_item
+
+
+class _CompiledTableConstraint(Constraint):
+
+    def __init__(self, table, variables, domains):
+        self._rows = table._rows
+        self._supports = table._supports
+        self._variables = list(variables)
+        self._columns_by_domain = {}
+        self._active_counts = [0] * len(self._rows)
+        self._candidate_accesses = 0
+
+        for column, variable in enumerate(self._variables):
+            domain = domains[variable]
+            columns = self._columns_by_domain.setdefault(id(domain), [])
+            if not columns:
+                domain.addStateListener(self)
+            columns.append(column)
+
+        for row_id, row in enumerate(self._rows):
+            active = True
+            for column, value in enumerate(row):
+                if value not in domains[self._variables[column]]:
+                    active = False
+                    break
+            if active:
+                self._active_counts[row_id] = len(row)
+
+        for column, variable in enumerate(self._variables):
+            domain = domains[variable]
+            supported = self._supports[column]
+            for value in domain[:]:
+                if value not in supported:
+                    domain.remove(value)
+
+    def valueHidden(self, domain, value):
+        self._changeActive(domain, value, -1)
+
+    def valueRemoved(self, domain, value):
+        self._changeActive(domain, value, -1)
+
+    def valueRestored(self, domain, value):
+        self._changeActive(domain, value, 1)
+
+    def _changeActive(self, domain, value, delta):
+        columns = self._columns_by_domain.get(id(domain))
+        if columns is None:
+            return
+        for column in columns:
+            row_ids = self._supports[column].get(value)
+            if not row_ids:
+                continue
+            for row_id in row_ids:
+                self._active_counts[row_id] += delta
+
+    def __call__(self, variables, domains, assignments, forwardcheck=False):
+        self._candidate_accesses = 0
+        unassigned = []
+        candidates = None
+
+        for column, variable in enumerate(self._variables):
+            if variable in assignments:
+                supported = self._supports[column].get(assignments[variable])
+                if supported is None:
+                    return False
+                if candidates is None:
+                    candidates = set(supported)
+                else:
+                    candidates &= supported
+                    if not candidates:
+                        return False
+            else:
+                unassigned.append(column)
+
+        if candidates is None:
+            candidates = set(range(len(self._rows)))
+
+        if not forwardcheck:
+            for row_id in candidates:
+                self._candidate_accesses += 1
+                if self._active_counts[row_id] == len(self._rows[row_id]):
+                    return True
+            return False
+
+        allowed = [set() for _ in self._variables]
+        supported_exists = False
+        for row_id in candidates:
+            self._candidate_accesses += 1
+            if self._active_counts[row_id] != len(self._rows[row_id]):
+                continue
+            supported_exists = True
+            row = self._rows[row_id]
+            for column in unassigned:
+                allowed[column].add(row[column])
+
+        if not supported_exists:
+            return False
+
+        for column in unassigned:
+            variable = self._variables[column]
+            domain = domains[variable]
+            for value in domain[:]:
+                if value not in allowed[column]:
+                    domain.hideValue(value)
+            if not domain:
+                return False
+        return True
 
 
 class AllDifferentConstraint(Constraint):
