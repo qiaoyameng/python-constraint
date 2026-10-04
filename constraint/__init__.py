@@ -38,6 +38,7 @@
                     MaxSumConstraint,
                     ExactSumConstraint,
                     MinSumConstraint,
+                    CumulativeConstraint,
                     InSetConstraint,
                     NotInSetConstraint,
                     SomeInSetConstraint,
@@ -58,6 +59,7 @@ from .version import __url__  # noqa
 
 import random
 import copy
+import numbers
 from .compat import xrange
 
 __all__ = [
@@ -76,6 +78,7 @@ __all__ = [
     "MaxSumConstraint",
     "ExactSumConstraint",
     "MinSumConstraint",
+    "CumulativeConstraint",
     "InSetConstraint",
     "NotInSetConstraint",
     "SomeInSetConstraint",
@@ -1289,6 +1292,178 @@ class MinSumConstraint(Constraint):
             if type(sum) is float:
                 sum = round(sum, 10)
             return sum >= minsum
+
+
+class CumulativeConstraint(Constraint):
+    """
+    Constraint enforcing cumulative resource usage over optional intervals.
+
+    Each variable represents an integer start time. The corresponding
+    duration and demand values define the half-open interval
+    C{[start, start + duration)} during which the resource demand is used.
+    Intervals with zero duration do not use any capacity.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b"], [0, 1])
+    >>> problem.addConstraint(CumulativeConstraint(1, [1, 1], [1, 1]))
+    >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+    [[('a', 0), ('b', 1)], [('a', 1), ('b', 0)]]
+    """
+
+    def __init__(self, capacity, durations, demands=None, requirements=None):
+        """
+        @param capacity: Maximum amount of resource available at any time
+        @type capacity: non-negative integer
+        @param durations: Duration of the task associated with each variable
+        @type durations: sequence of non-negative integers
+        @param demands: Resource amount demanded by each task
+        @type demands: sequence of non-negative integers, or C{None}
+                       for one unit per task
+        @param requirements: Alias for C{demands}
+        @type requirements: sequence of non-negative integers, or C{None}
+        """
+        if demands is not None and requirements is not None:
+            raise ValueError("demands and requirements are aliases")
+        if demands is None:
+            demands = requirements
+
+        durations = list(durations)
+        if demands is None:
+            demands = [1] * len(durations)
+        else:
+            demands = list(demands)
+
+        self._capacity = self._check_integer(capacity, "capacity")
+        if len(durations) != len(demands):
+            raise ValueError("durations and demands must have same length")
+        self._durations = [
+            self._check_integer(duration, "duration") for duration in durations
+        ]
+        self._demands = [
+            self._check_integer(demand, "demand") for demand in demands
+        ]
+
+    @staticmethod
+    def _check_integer(value, name, negative=False):
+        if not isinstance(value, numbers.Integral):
+            raise TypeError("%s must be an integer" % name)
+        if not negative and value < 0:
+            raise ValueError("%s must be non-negative" % name)
+        return value
+
+    def _items(self, variables, domains):
+        if len(variables) != len(self._durations):
+            raise ValueError("constraint variables and tasks must have same length")
+
+        items = []
+        for index, variable in enumerate(variables):
+            domain = domains[variable]
+            for value in domain:
+                self._check_integer(value, "start time", negative=True)
+            duration = self._durations[index]
+            demand = self._demands[index]
+            if duration and demand:
+                items.append((variable, duration, demand))
+        return items
+
+    @staticmethod
+    def _mandatory_interval(values, duration):
+        if not values:
+            return None
+        start = max(values)
+        end = min(values) + duration
+        if start >= end:
+            return None
+        return start, end
+
+    @staticmethod
+    def _overloaded(intervals, capacity):
+        events = {}
+        for start, end, demand in intervals:
+            if start >= end or demand == 0:
+                continue
+            events[start] = events.get(start, 0) + demand
+            events[end] = events.get(end, 0) - demand
+
+        usage = 0
+        for point in sorted(events):
+            usage += events[point]
+            if usage > capacity:
+                return True
+        return False
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        while True:
+            items = self._items(variables, domains)
+            if any(not domains[variable] for variable in variables):
+                return
+
+            mandatory = {}
+            for variable, duration, demand in items:
+                interval = self._mandatory_interval(
+                    list(domains[variable]), duration
+                )
+                if interval is not None:
+                    mandatory[variable] = interval + (demand,)
+
+            changed = False
+            for variable, duration, demand in items:
+                domain = domains[variable]
+                for start in domain[:]:
+                    intervals = [(start, start + duration, demand)]
+                    for other_variable, interval in mandatory.items():
+                        if other_variable != variable:
+                            intervals.append(interval)
+                    if self._overloaded(intervals, self._capacity):
+                        domain.remove(start)
+                        changed = True
+            if not changed:
+                return
+
+    def __call__(self, variables, domains, assignments, forwardcheck=False):
+        items = self._items(variables, domains)
+        assigned = []
+        unassigned = []
+
+        for variable, duration, demand in items:
+            if variable in assignments:
+                start = assignments[variable]
+                self._check_integer(start, "start time", negative=True)
+                assigned.append((start, start + duration, demand))
+            else:
+                unassigned.append((variable, duration, demand))
+
+        def mandatory_intervals(exclude=None):
+            intervals = []
+            for variable, duration, demand in unassigned:
+                if variable == exclude:
+                    continue
+                interval = self._mandatory_interval(
+                    list(domains[variable]), duration
+                )
+                if interval is not None:
+                    intervals.append(interval + (demand,))
+            return intervals
+
+        if self._overloaded(assigned + mandatory_intervals(), self._capacity):
+            return False
+
+        if not forwardcheck:
+            return True
+
+        for variable, duration, demand in unassigned:
+            domain = domains[variable]
+            for start in domain[:]:
+                intervals = assigned + [(start, start + duration, demand)]
+                intervals.extend(mandatory_intervals(exclude=variable))
+                if self._overloaded(intervals, self._capacity):
+                    domain.hideValue(start)
+            if not domain:
+                return False
+
+        return True
 
 
 class InSetConstraint(Constraint):

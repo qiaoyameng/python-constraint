@@ -1,4 +1,12 @@
+import pytest
+
 import constraint
+from constraint import (
+    BacktrackingSolver,
+    CumulativeConstraint,
+    Problem,
+    RecursiveBacktrackingSolver,
+)
 
 from examples.abc import abc
 from examples.coins import coins
@@ -112,3 +120,138 @@ def test_constraint_without_variables():
 
 def test_version():
     assert isinstance(constraint.__version__, compat.string_types)
+
+
+def test_cumulative_negative_starts_and_half_open_interval():
+    problem = Problem()
+    problem.addVariables(["a", "b"], [-1, 0])
+    problem.addConstraint(CumulativeConstraint(1, [1, 1], [1, 1]))
+
+    assert problem.getSolutions() == [
+        {"a": 0, "b": -1},
+        {"a": -1, "b": 0},
+    ]
+
+
+def test_cumulative_allows_touching_intervals():
+    problem = Problem()
+    problem.addVariable("a", [0])
+    problem.addVariable("b", [0, 1])
+    problem.addConstraint(CumulativeConstraint(1, [1, 1], [1, 1]))
+
+    assert problem.getSolution() == {"a": 0, "b": 1}
+
+
+def test_cumulative_handles_peak_from_three_tasks():
+    problem = Problem()
+    problem.addVariables(["a", "b", "c"], [0, 1])
+    problem.addConstraint(CumulativeConstraint(2, [1, 1, 1], [1, 1, 1]))
+
+    solutions = problem.getSolutions()
+
+    assert len(solutions) == 6
+    assert {"a": 0, "b": 0, "c": 0} not in solutions
+    assert {"a": 1, "b": 1, "c": 1} not in solutions
+
+
+def test_cumulative_zero_duration_does_not_use_capacity():
+    problem = Problem()
+    problem.addVariables(["a", "b"], [0])
+    problem.addConstraint(CumulativeConstraint(1, [1, 0], [1, 5]))
+
+    assert problem.getSolution() == {"a": 0, "b": 0}
+
+
+def test_cumulative_capacity_shortage_is_unsatisfiable():
+    problem = Problem()
+    problem.addVariables(["a", "b"], [0])
+    problem.addConstraint(CumulativeConstraint(1, [1, 1], [1, 1]))
+
+    assert problem.getSolution() is None
+    assert problem.getSolutions() == []
+
+
+def test_cumulative_treats_empty_pruned_domain_as_unsatisfiable():
+    problem = Problem()
+    problem.addVariable("a", [0])
+    problem.addVariable("b", [0, 1])
+    problem.addConstraint(lambda b: False, ["b"])
+    problem.addConstraint(CumulativeConstraint(1, [1, 1], [1, 1]))
+
+    assert problem.getSolution() is None
+    assert problem.getSolutions() == []
+
+
+def test_cumulative_prunes_impossible_start_domains():
+    problem = Problem()
+    problem.addVariable("a", [0])
+    problem.addVariable("b", [-1, 1, 2])
+    problem.addConstraint(CumulativeConstraint(1, [2, 2], [1, 1]))
+
+    domains, _, _ = problem._getArgs()
+
+    assert list(domains["a"]) == [0]
+    assert list(domains["b"]) == [2]
+
+
+def test_cumulative_can_solve_same_problem_after_backtracking():
+    problem = Problem(BacktrackingSolver())
+    problem.addVariables(["a", "b", "c"], [0, 1])
+    problem.addConstraint(CumulativeConstraint(2, [1, 1, 1], [1, 1, 1]))
+
+    first_solution = problem.getSolution()
+
+    assert first_solution == problem.getSolution()
+
+
+def test_cumulative_with_recursive_backtracking_solver():
+    problem = Problem(RecursiveBacktrackingSolver())
+    problem.addVariables(["a", "b"], [0, 1])
+    problem.addConstraint(CumulativeConstraint(1, [1, 1], [1, 1]))
+
+    assert problem.getSolution() in (
+        {"a": 0, "b": 1},
+        {"a": 1, "b": 0},
+    )
+
+
+def test_cumulative_validates_integer_non_negative_task_data():
+    with pytest.raises(TypeError):
+        CumulativeConstraint(1, [1.0], [1])
+    with pytest.raises(ValueError):
+        CumulativeConstraint(1, [-1], [1])
+    with pytest.raises(TypeError):
+        CumulativeConstraint(1, [1], [1.0])
+    with pytest.raises(ValueError):
+        CumulativeConstraint(1, [1], [-1])
+
+
+def test_cumulative_validates_matching_task_data_length():
+    with pytest.raises(ValueError):
+        CumulativeConstraint(1, [1, 1], [1])
+
+
+def test_cumulative_accepts_demands_keyword():
+    problem = Problem()
+    problem.addVariables(["a", "b"], [0, 1])
+    problem.addConstraint(CumulativeConstraint(1, [1, 1], demands=[1, 1]))
+
+    assert len(problem.getSolutions()) == 2
+
+
+def test_cumulative_uses_unit_demands_by_default():
+    problem = Problem()
+    problem.addVariables(["a", "b"], [0])
+    problem.addConstraint(CumulativeConstraint(2, [1, 1]))
+
+    assert problem.getSolution() == {"a": 0, "b": 0}
+
+
+def test_cumulative_rejects_demand_aliases_used_together():
+    with pytest.raises(ValueError):
+        CumulativeConstraint(
+            1,
+            [1, 1],
+            demands=[1, 1],
+            requirements=[1, 1],
+        )
