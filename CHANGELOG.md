@@ -5,6 +5,13 @@
 All notable changes to this code base will be documented in this file,
 in every released version.
 
+### Unreleased
+
+- Issues/Enhancements:
+  - Add `GlobalCardinalityConstraint` enforcing per-value minimum and
+    maximum occurrence counts over a shared pool of variables, with
+    open or closed value domains and flow-based propagation
+
 ### Version 1.4.0
 
 - Released: 2018-11-05

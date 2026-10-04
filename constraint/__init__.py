@@ -41,7 +41,8 @@
                     InSetConstraint,
                     NotInSetConstraint,
                     SomeInSetConstraint,
-                    SomeNotInSetConstraint
+                    SomeNotInSetConstraint,
+                    GlobalCardinalityConstraint
 """
 
 from __future__ import absolute_import, division, print_function
@@ -80,6 +81,7 @@ __all__ = [
     "NotInSetConstraint",
     "SomeInSetConstraint",
     "SomeNotInSetConstraint",
+    "GlobalCardinalityConstraint",
 ]
 
 
@@ -1493,6 +1495,333 @@ class SomeNotInSetConstraint(Constraint):
                 if found < self._n:
                     return False
         return True
+
+
+_OTHER_VALUE = object()
+
+
+class GlobalCardinalityConstraint(Constraint):
+    """
+    Constraint enforcing lower and upper bounds on the number of times
+    each value may be assigned to the constrained variables.
+
+    This is a generalized cardinality (GCC) constraint. Unlike combining
+    several L{SomeInSetConstraint} instances, propagation reasons over
+    the fact that several values compete for the very same pool of
+    variables: feasibility is checked through a single flow network
+    shared by all bounded values, so a value is pruned when it could not
+    be taken while still leaving enough variables able to cover every
+    other value's minimum count.
+
+    Bounds are given as a mapping of values to either an exact count
+    (an integer) or a pair of C{(minimum, maximum)} counts.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b", "c"], [1, 2])
+    >>> problem.addConstraint(GlobalCardinalityConstraint({1: (1, 2),
+    ...                                                    2: (1, 2)}))
+    >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+    [[('a', 1), ('b', 1), ('c', 2)], [('a', 1), ('b', 2), ('c', 1)], [('a', 1), ('b', 2), ('c', 2)], [('a', 2), ('b', 1), ('c', 1)], [('a', 2), ('b', 1), ('c', 2)], [('a', 2), ('b', 2), ('c', 1)]]
+
+    With C{closed=True} values absent from the mapping are forbidden, so
+    every variable must take one of the listed values; by default the
+    value domain is open and unlisted values are free (unbounded):
+
+    >>> problem = Problem()
+    >>> problem.addVariables(["a", "b"], [1, 2, 3])
+    >>> problem.addConstraint(GlobalCardinalityConstraint({1: 1, 2: 1}, closed=True))
+    >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+    [[('a', 1), ('b', 2)], [('a', 2), ('b', 1)]]
+    """
+
+    def __init__(self, bounds, closed=False):
+        """
+        @param bounds: Mapping of values to an exact count (C{int}) or to
+                       a C{(minimum, maximum)} pair of non-negative ints
+                       with C{minimum <= maximum}
+        @type  bounds: dict
+        @param closed: If true, values not present in C{bounds} may not
+                       be assigned; otherwise they are allowed without
+                       any cardinality restriction
+        @type  closed: bool
+        """
+        if not isinstance(bounds, dict):
+            msg = "GlobalCardinalityConstraint bounds must be a dict, got %s" % (
+                type(bounds).__name__
+            )
+            raise TypeError(msg)
+        parsed_bounds = {}
+        for value, bound in bounds.items():
+            if isinstance(bound, bool) or not isinstance(bound, int):
+                if not isinstance(bound, (tuple, list)) or len(bound) != 2:
+                    msg = (
+                        "Bound for value %r must be an exact count or a "
+                        "(minimum, maximum) pair" % (value,)
+                    )
+                    raise ValueError(msg)
+                minimum, maximum = bound
+            else:
+                minimum = maximum = bound
+            if (
+                isinstance(minimum, bool)
+                or isinstance(maximum, bool)
+                or not isinstance(minimum, int)
+                or not isinstance(maximum, int)
+            ):
+                msg = "Bounds for value %r must be integer counts" % (value,)
+                raise ValueError(msg)
+            if minimum < 0 or maximum < 0:
+                msg = "Bounds for value %r must not be negative" % (value,)
+                raise ValueError(msg)
+            if minimum > maximum:
+                msg = (
+                    "Minimum count for value %r (%d) is greater than its "
+                    "maximum count (%d)" % (value, minimum, maximum)
+                )
+                raise ValueError(msg)
+            parsed_bounds[value] = (minimum, maximum)
+        self._bounds = parsed_bounds
+        self._closed = closed
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        if len(set(variables)) != len(variables):
+            seen = []
+            duplicated = []
+            for variable in variables:
+                if variable in seen and variable not in duplicated:
+                    duplicated.append(variable)
+                seen.append(variable)
+            msg = (
+                "GlobalCardinalityConstraint was added over duplicated "
+                "variables: %r" % (duplicated,)
+            )
+            raise ValueError(msg)
+        if self._closed:
+            for variable in variables:
+                domain = domains[variable]
+                for value in domain[:]:
+                    if value not in self._bounds:
+                        domain.remove(value)
+        forced_counts = {}
+        for variable in variables:
+            domain = domains[variable]
+            if len(domain) == 1:
+                value = domain[0]
+                if value in self._bounds:
+                    forced_counts[value] = forced_counts.get(value, 0) + 1
+        for value, bounds in self._bounds.items():
+            maximum = bounds[1]
+            count = forced_counts.get(value, 0)
+            if count > maximum:
+                msg = (
+                    "Value %r is already forced on %d variable(s), but its "
+                    "cardinality upper bound is %d"
+                    % (value, count, maximum)
+                )
+                raise ValueError(msg)
+        if len(variables) == 1:
+            Constraint.preProcess(self, variables, domains, constraints, vconstraints)
+            return
+        # Root propagation. Domains are the original, un-pushed copies, so
+        # pruned values are removed permanently rather than hidden.
+        self(variables, domains, {}, forwardcheck=True, _permanent=True)
+
+    def __call__(
+        self,
+        variables,
+        domains,
+        assignments,
+        forwardcheck=False,
+        _permanent=False,
+    ):
+        counts = {}
+        unassigned = []
+        for variable in variables:
+            if variable in assignments:
+                value = assignments[variable]
+                if self._closed and value not in self._bounds:
+                    return False
+                if value in self._bounds:
+                    count = counts.get(value, 0) + 1
+                    counts[value] = count
+                    if count > self._bounds[value][1]:
+                        return False
+            else:
+                unassigned.append(variable)
+
+        if not unassigned:
+            for value, bounds in self._bounds.items():
+                count = counts.get(value, 0)
+                if count < bounds[0] or count > bounds[1]:
+                    return False
+            return True
+
+        if any(variable not in domains for variable in unassigned):
+            return True
+
+        if not self._is_feasible(unassigned, domains, counts):
+            return False
+
+        if forwardcheck:
+            for variable in unassigned:
+                domain = domains[variable]
+                for value in domain[:]:
+                    key = self._value_key(value)
+                    if key is None:
+                        if self._closed:
+                            self._prune(domain, value, _permanent)
+                        continue
+                    trial_counts = dict(counts)
+                    trial_counts[key] = trial_counts.get(key, 0) + 1
+                    remaining = [other for other in unassigned if other != variable]
+                    if not self._is_feasible(remaining, domains, trial_counts):
+                        self._prune(domain, value, _permanent)
+                if not domain:
+                    return False
+        return True
+
+    def _value_key(self, value):
+        if value in self._bounds:
+            return value
+        if self._closed:
+            return None
+        return _OTHER_VALUE
+
+    @staticmethod
+    def _prune(domain, value, permanent):
+        if permanent:
+            domain.remove(value)
+        else:
+            domain.hideValue(value)
+
+    def _support(self, unassigned, domains):
+        support = {}
+        for variable in unassigned:
+            keys = []
+            for value in domains[variable]:
+                key = self._value_key(value)
+                if key is not None and key not in keys:
+                    keys.append(key)
+            support[variable] = keys
+        return support
+
+    def _is_feasible(self, unassigned, domains, counts):
+        """
+        Tell whether the unassigned variables can still be completed.
+
+        A single flow network is shared by every bounded value, so the
+        check handles values competing for the same variables instead of
+        deriving an independent remainder for each value.
+        """
+        values = list(self._bounds)
+        if not self._closed:
+            values.append(_OTHER_VALUE)
+
+        support = self._support(unassigned, domains)
+
+        source = 0
+        sink = 1
+        value_base = 2
+        variable_base = value_base + len(values)
+        super_source = variable_base + len(unassigned)
+        super_sink = super_source + 1
+        node_count = super_sink + 1
+        graph = [[] for _ in range(node_count)]
+        balance = [0] * node_count
+
+        def add_edge(origin, destination, capacity):
+            graph[origin].append([destination, len(graph[destination]), capacity])
+            graph[destination].append([origin, len(graph[origin]) - 1, 0])
+
+        def add_lower_bounded_edge(origin, destination, lower, capacity):
+            if lower > capacity:
+                return False
+            add_edge(origin, destination, capacity - lower)
+            balance[origin] -= lower
+            balance[destination] += lower
+            return True
+
+        # Circulation with lower bounds: closing edge source <- sink.
+        add_edge(sink, source, len(unassigned) + 1)
+
+        for index, key in enumerate(values):
+            node = value_base + index
+            if key is _OTHER_VALUE:
+                lower = 0
+                capacity = len(unassigned)
+            else:
+                minimum, maximum = self._bounds[key]
+                assigned = counts.get(key, 0)
+                capacity = maximum - assigned
+                lower = minimum - assigned
+                if lower < 0:
+                    lower = 0
+                if capacity < 0:
+                    return False
+            if not add_lower_bounded_edge(source, node, lower, capacity):
+                return False
+
+        value_index = dict((key, index) for index, key in enumerate(values))
+        for index, variable in enumerate(unassigned):
+            node = variable_base + index
+            # Every unassigned variable must take exactly one value.
+            if not add_lower_bounded_edge(node, sink, 1, 1):
+                return False
+            for key in support[variable]:
+                add_edge(value_base + value_index[key], node, 1)
+
+        required_flow = 0
+        for node, demand in enumerate(balance):
+            if demand > 0:
+                add_edge(super_source, node, demand)
+                required_flow += demand
+            elif demand < 0:
+                add_edge(node, super_sink, -demand)
+
+        return self._max_flow(graph, super_source, super_sink) == required_flow
+
+    @staticmethod
+    def _max_flow(graph, source, sink):
+        flow = 0
+        while True:
+            previous = [None] * len(graph)
+            previous[source] = source
+            queue = [source]
+            head = 0
+            while head < len(queue):
+                node = queue[head]
+                head += 1
+                for edge_index, edge in enumerate(graph[node]):
+                    neighbour, _, capacity = edge
+                    if capacity > 0 and previous[neighbour] is None:
+                        previous[neighbour] = (node, edge_index)
+                        if neighbour == sink:
+                            break
+                        queue.append(neighbour)
+                if previous[sink] is not None:
+                    break
+            if previous[sink] is None:
+                return flow
+
+            bottleneck = None
+            node = sink
+            while node != source:
+                parent, edge_index = previous[node]
+                capacity = graph[parent][edge_index][2]
+                if bottleneck is None or capacity < bottleneck:
+                    bottleneck = capacity
+                node = parent
+            node = sink
+            while node != source:
+                parent, edge_index = previous[node]
+                edge = graph[parent][edge_index]
+                edge[2] -= bottleneck
+                reverse_index = edge[1]
+                graph[node][reverse_index][2] += bottleneck
+                node = parent
+            flow += bottleneck
 
 
 if __name__ == "__main__":
