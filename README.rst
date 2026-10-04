@@ -116,6 +116,7 @@ Predefined constraint types currently available:
 - :python:`NotInSetConstraint`
 - :python:`SomeInSetConstraint`
 - :python:`SomeNotInSetConstraint`
+- :python:`RegularConstraint`
 
 API documentation
 -----------------

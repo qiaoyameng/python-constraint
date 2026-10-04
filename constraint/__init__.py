@@ -41,7 +41,8 @@
                     InSetConstraint,
                     NotInSetConstraint,
                     SomeInSetConstraint,
-                    SomeNotInSetConstraint
+                    SomeNotInSetConstraint,
+                    RegularConstraint
 """
 
 from __future__ import absolute_import, division, print_function
@@ -80,6 +81,7 @@ __all__ = [
     "NotInSetConstraint",
     "SomeInSetConstraint",
     "SomeNotInSetConstraint",
+    "RegularConstraint",
 ]
 
 
@@ -1492,6 +1494,132 @@ class SomeNotInSetConstraint(Constraint):
             else:
                 if found < self._n:
                     return False
+        return True
+
+
+class RegularConstraint(Constraint):
+    """
+    Constraint enforcing that the sequence of values assigned to the
+    given ordered variables is accepted by a given finite automaton
+
+    The automaton is described by a set of transitions, a set of
+    initial states, and a set of final (accepting) states. Multiple
+    initial states and non-deterministic transitions are allowed.
+    Epsilon transitions are not supported: transitions carry a single
+    symbol, and C{None} is rejected as a symbol. State names and
+    variable names may be any hashable objects, not only strings.
+
+    The empty sequence is accepted exactly when some initial state is
+    also a final state. Final states unreachable from the initial
+    states simply make the constraint unsatisfiable.
+
+    Example:
+
+    >>> problem = Problem()
+    >>> problem.addVariables([0, 1], ["a", "b"])
+    >>> transitions = [("q0", "a", "q1"), ("q0", "b", "q0"),
+    ...                ("q1", "a", "q1"), ("q1", "b", "q1")]
+    >>> constraint = RegularConstraint(transitions, ["q0"], ["q1"])
+    >>> problem.addConstraint(constraint, [0, 1])
+    >>> sorted(sorted(x.items()) for x in problem.getSolutions())
+    [[(0, 'a'), (1, 'a')], [(0, 'a'), (1, 'b')], [(0, 'b'), (1, 'a')]]
+    """
+
+    def __init__(self, transitions, initial_states, final_states):
+        """
+        @param transitions: Iterable of C{(state, symbol, state)} tuples
+                            describing the automaton transitions. The
+                            symbol may not be C{None}, since epsilon
+                            transitions are not supported.
+        @type  transitions: iterable of tuples
+        @param initial_states: Initial automaton states (one or more)
+        @type  initial_states: iterable of hashable objects
+        @param final_states: Accepting automaton states
+        @type  final_states: iterable of hashable objects
+        """
+        self._transitions = {}
+        for source, symbol, target in transitions:
+            if symbol is None:
+                msg = "Epsilon transitions are not supported"
+                raise ValueError(msg)
+            transitions_from = self._transitions.setdefault(source, {})
+            transitions_from.setdefault(symbol, set()).add(target)
+        self._initial_states = set(initial_states)
+        self._final_states = set(final_states)
+
+    def _supportedValues(self, domains_list):
+        """
+        Sweep the automaton forwards and backwards over the given
+        per-position sets of currently possible values, and return a
+        list with one set of supported values per position. Values
+        without support from a complete accepting path are left out.
+        Return None if no complete accepting path exists at all.
+        """
+        transitions = self._transitions
+        count = len(domains_list)
+        forward = [set(self._initial_states)]
+        for i in range(count):
+            values = domains_list[i]
+            states = set()
+            for state in forward[i]:
+                for symbol, targets in transitions.get(state, {}).items():
+                    if symbol in values:
+                        states.update(targets)
+            if not states:
+                return None
+            forward.append(states)
+        backward = forward[count] & self._final_states
+        if not backward:
+            return None
+        supported = [set() for _ in range(count)]
+        for i in range(count - 1, -1, -1):
+            values = domains_list[i]
+            nextstates = backward
+            backward = set()
+            for state in forward[i]:
+                for symbol, targets in transitions.get(state, {}).items():
+                    if symbol in values and not targets.isdisjoint(nextstates):
+                        backward.add(state)
+                        supported[i].add(symbol)
+            if not backward:
+                return None
+        return supported
+
+    def preProcess(self, variables, domains, constraints, vconstraints):
+        if len(variables) == 1:
+            Constraint.preProcess(
+                self, variables, domains, constraints, vconstraints
+            )
+            return
+        domains_list = [set(domains[variable]) for variable in variables]
+        supported = self._supportedValues(domains_list)
+        if supported is None:
+            supported = [set() for _ in variables]
+        for i, variable in enumerate(variables):
+            domain = domains[variable]
+            for value in domain[:]:
+                if value not in supported[i]:
+                    domain.remove(value)
+
+    def __call__(self, variables, domains, assignments, forwardcheck=False):
+        domains_list = []
+        for variable in variables:
+            if variable in assignments:
+                domains_list.append(set([assignments[variable]]))
+            else:
+                domains_list.append(set(domains[variable]))
+        supported = self._supportedValues(domains_list)
+        if supported is None:
+            return False
+        if forwardcheck:
+            for i, variable in enumerate(variables):
+                if variable not in assignments:
+                    domain = domains[variable]
+                    for value in domain[:]:
+                        if value not in supported[i]:
+                            domain.hideValue(value)
+                    if not domain:
+                        return False
         return True
 
 
